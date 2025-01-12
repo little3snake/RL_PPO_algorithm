@@ -6,6 +6,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 import numpy as np
+import pytorch_lightning as pl
 
 class NN(nn.Module):
   def __init__(self, input_dim, output_dim):
@@ -15,10 +16,6 @@ class NN(nn.Module):
     self.layer3 = nn.Linear(64, output_dim)
 
   def forward(self, n_observations):
-    #if isinstance(n_observations, np.ndarray):
-    #  n_observations = torch.tensor(n_observations, dtype=torch.float, device=device)
-    #else:
-    #  n_observations = n_observations.to(device)
     x = F.relu(self.layer1(n_observations))
     x = F.relu(self.layer2(x))
     return self.layer3(x)
