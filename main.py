@@ -3,9 +3,15 @@ import torch
 import matplotlib.pyplot as plt
 from matplotlib import animation
 from torch.utils.tensorboard import SummaryWriter
+from torch.utils.data import DataLoader
 import torch.backends.cudnn as cudnn
+
+from pytorch_lightning import Trainer
+from pytorch_lightning.loggers import TensorBoardLogger
+
 from ppo import PPO
 from network import NN
+from GeneratorDataset import GeneratorDataset
 
 cudnn.benchmark = True
 
@@ -64,8 +70,6 @@ def train(env_name, hyperparameters, device=torch.device('cpu'), writer=None):
 
 if __name__ == "__main__":
     #import multiprocessing
-
-    # Устанавливаем метод запуска процессов
     #multiprocessing.set_start_method('spawn', force=True)
 
     #Optim hyperparams (find via optuna)
@@ -79,4 +83,23 @@ if __name__ == "__main__":
     }
 
     env_name = "BipedalWalker-v3"
-    train(env_name=env_name, hyperparameters=hyperparameters, device=device, writer=writer)
+
+    logger = TensorBoardLogger("logs", name="ppo_lightning")
+
+    model = PPO(policy_class=NN, env_name=env_name, device=device, writer=writer, **hyperparameters)
+    trainer = Trainer(max_epochs=5000, logger=logger, log_every_n_steps=10)
+    #train(env_name=env_name, hyperparameters=hyperparameters, device=device, writer=writer)
+    # Simulated dataloader - replace with real one if needed
+    def simulated_dataloader():
+        while True:
+            yield model.rollout()
+
+
+    #dataset = GeneratorDataset(simulated_dataloader())
+    #data_loader = DataLoader(dataset, batch_size=32, num_workers=0)
+    # Преобразовать генератор в список перед использованием
+    data_list = list(simulated_dataloader())
+    dataset = GeneratorDataset(iter(data_list))
+    data_loader = DataLoader(dataset, batch_size=32, num_workers=3)
+
+    trainer.fit(model, data_loader)
