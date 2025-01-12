@@ -2,12 +2,15 @@ import gymnasium as gym
 import torch
 import matplotlib.pyplot as plt
 from matplotlib import animation
-from torch.utils.tensorboard import SummaryWriter
-import torch.backends.cudnn as cudnn
+#from torch.utils.tensorboard import SummaryWriter
+#import torch.backends.cudnn as cudnn
 from ppo import PPO
 from network import NN
 
-cudnn.benchmark = True
+import pytorch_lightning as pl
+from pytorch_lightning.loggers import TensorBoardLogger
+
+#cudnn.benchmark = True
 
 device = torch.device(
     "cuda" if torch.cuda.is_available() else
@@ -16,9 +19,10 @@ device = torch.device(
 )
 #torch.cuda.set_per_process_memory_fraction(0.85)  # Использовать не более 85% памяти
 
-writer = SummaryWriter(
-    log_dir=r"C:\Users\user\Python ML\PyTorch\BipedalWalker_ppo_PTorch\logs_ppo\ppo_pt_bipedal_walker_logs"
-)
+#writer = SummaryWriter(
+#    log_dir=r"C:\Users\user\Python ML\PyTorch\BipedalWalker_ppo_PTorch\logs_ppo\ppo_pt_bipedal_walker_logs"
+#)
+logger = TensorBoardLogger("logs", name="ppo_training")
 
 
 def save_frames_as_gif(frames, path='./', filename='bipedalWalker_ppo_PT_post_training.gif'):
@@ -33,7 +37,7 @@ def save_frames_as_gif(frames, path='./', filename='bipedalWalker_ppo_PT_post_tr
     anim.save(path + filename, writer='imagemagick', fps=60)
 
 
-def train(env_name, hyperparameters, device=torch.device('cpu'), writer=None):
+'''def train(env_name, hyperparameters, device=torch.device('cpu'), writer=None):
     """
     Trains the model.
 
@@ -59,15 +63,10 @@ def train(env_name, hyperparameters, device=torch.device('cpu'), writer=None):
 
     # Закрываем среду и освобождаем память
     #env.close()
-    torch.cuda.empty_cache()
+    torch.cuda.empty_cache()'''
 
 
 if __name__ == "__main__":
-    #import multiprocessing
-
-    # Устанавливаем метод запуска процессов
-    #multiprocessing.set_start_method('spawn', force=True)
-
     #Optim hyperparams (find via optuna)
     hyperparameters = {
         'timesteps_per_batch': 2048,
@@ -76,7 +75,18 @@ if __name__ == "__main__":
         'n_updates_per_iteration': 18,
         'learning_rate': 0.0004755,
         'clip': 0.286,
+        'save_freq': 1000,
     }
 
     env_name = "BipedalWalker-v3"
-    train(env_name=env_name, hyperparameters=hyperparameters, device=device, writer=writer)
+    env = gym.make(env_name, render_mode='rgb_array')
+    policy = PPO(policy_class=NN, env=env, writer=None, **hyperparameters)
+
+    trainer = pl.Trainer(logger=logger, max_epochs=5, log_every_n_steps=50,
+                         accelerator="gpu" if torch.cuda.is_available() else "cpu")
+    trainer.fit(policy)
+    env.close()
+    # Generating GIF
+    frames, total_reward = policy.generate_gif_after_training()
+    save_frames_as_gif(frames)
+    print('Total reward with trained model:', total_reward)
