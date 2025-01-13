@@ -83,7 +83,7 @@ if __name__ == "__main__":
     policy = PPO(policy_class=NN, env=env, writer=None, **hyperparameters)
 
     trainer = pl.Trainer(logger=logger, max_epochs=5, log_every_n_steps=50,
-                         accelerator="gpu" if torch.cuda.is_available() else "cpu")
+                         accelerator="cpu" if torch.cuda.is_available() else "cpu")
     trainer.fit(policy)
     env.close()
     # Generating GIF
