@@ -5,7 +5,6 @@ import torch
 import torch.nn as nn
 from torch import dtype
 from torch.optim import Adam
-#from torch.distributions import MultivariateNormal
 from torch.cuda.amp import autocast, GradScaler
 import pytorch_lightning as pl
 from torch.utils.data import IterableDataset, DataLoader
@@ -60,60 +59,10 @@ class PPO(pl.LightningModule):
         #self.cov_var = torch.full(size=(self.n_actions,), fill_value=0.5)
         #self.cov_mat = torch.diag(self.cov_var)
 
-        # This logger will help us with printing out summaries of each iteration
-        '''self.logger = {
-            'delta_t': time.time_ns(),
-            'timesteps_current': 0,
-            'iterations_current': 0,
-            'batch_lens': [],
-            'batch_rewards': [],    # episodic returns
-            'actor_losses': [],     # losses of actor network in current iteration
-        }'''
-
     #def on_train_start(self):
         # Move covariance matrix to device when training starts
         #self.cov_var = self.cov_var.to(self.device)
         #self.cov_mat = self.cov_mat.to(self.device)
-
-    '''def rollout(self):
-        batch_observations, batch_actions, batch_log_probs = [], [], []
-        batch_rewards, batch_discounted_rewards, batch_lens = [], [], []
-        current_timestep = 0
-
-        while current_timestep < self.timesteps_per_batch:
-            episode_rewards = []
-            observation, _ = self.env.reset()  # Reset the environment
-            observation = torch.tensor(observation, dtype=torch.float, device=self.device)
-            done = False
-            timestep_start = current_timestep
-
-            for _ in range(self.max_timesteps_per_episode):
-                current_timestep += 1
-                batch_observations.append(observation)
-                with torch.no_grad():
-                    action, log_prob = self.get_action(observation)
-
-                observation, reward, terminated, truncated, _ = self.env.step(action.cpu().numpy())
-                observation = torch.tensor(observation, dtype=torch.float, device=self.device)
-                episode_rewards.append(reward)
-                batch_actions.append(action)
-                batch_log_probs.append(log_prob)
-                if terminated or truncated:
-                    break
-
-            batch_lens.append(len(episode_rewards))
-            batch_rewards.append(episode_rewards)
-
-        #batch_observations = torch.tensor(batch_observations, dtype=torch.float).to(self.device)
-        batch_observations = torch.stack(batch_observations).to(self.device)
-        batch_actions = torch.stack(batch_actions).to(self.device)
-        batch_log_probs = torch.stack(batch_log_probs).to(self.device)
-        batch_discounted_rewards = self.compute_discounted_rewards(batch_rewards).to(self.device)
-
-        self.logger['batch_rewards'] = batch_rewards
-        self.logger['batch_lens'] = batch_lens
-
-        return batch_observations, batch_actions, batch_log_probs, batch_discounted_rewards, batch_lens'''
 
     def compute_discounted_rewards(self, batch_rewards):
         batch_discounted_rewards = []
@@ -123,13 +72,6 @@ class PPO(pl.LightningModule):
                 discounted_reward = rew + discounted_reward * self.gamma
                 batch_discounted_rewards.insert(0, discounted_reward)
         return torch.tensor(batch_discounted_rewards, dtype=torch.float)
-
-    '''def get_action(self, observation):
-        mean = self.actor(observation.to(self.device))
-        distribution = MultivariateNormal(mean, self.cov_mat)
-        action = distribution.sample()
-        log_prob = distribution.log_prob(action)
-        return action.detach(), log_prob.detach()'''
 
     def evaluate(self, observations, actions):
         V = self.critic(observations.to(self.device)).squeeze()
@@ -148,9 +90,6 @@ class PPO(pl.LightningModule):
         #mean = self.actor(observations.to(self.device)) # actor on device
         #distribution = MultivariateNormal(mean, self.cov_mat) # cov_mat on device
         #log_probs = distribution.log_prob(actions.to(self.device)) # distribution on device
-        #print("Observations:", observations)
-        #print("Actions:", actions)
-
         log_probs = self.actor.evaluate(observations, actions)
         return V, log_probs
 
@@ -172,8 +111,6 @@ class PPO(pl.LightningModule):
             device=self.device,
             compute_discounted_rewards=self.compute_discounted_rewards
         )
-        # Передаем ковариационную матрицу в PPO
-        #self.set_cov_mat(dataset.cov_mat)
 
         return DataLoader(dataset, batch_size=None, num_workers=0)
         # return DataLoader(dataset, batch_size=1, num_workers=0)
@@ -210,15 +147,11 @@ class PPO(pl.LightningModule):
         #batch_observations, batch_actions, batch_log_probs, batch_discounted_rewards, batch_lens = self.rollout() # ALG STEP 3
         rollout_end = time.time()
         rollout_time = rollout_end - rollout_start
-        #self.logger['rollout_time'] = rollout_end - rollout_start
 
         # Calculate how many timesteps we collected this batch
         #timesteps_current += np.sum(batch_lens)
-        #iterations_current += 1
         self.timesteps_current += torch.sum(torch.tensor(batch_lens)).item()
         self.iterations_current += 1
-        #self.logger['timesteps_current'] = timesteps_current
-        #self.logger['iterations_current'] = iterations_current
 
         counting_start = time.time()
         V, _ = self.evaluate(batch_observations, batch_actions)
@@ -227,18 +160,16 @@ class PPO(pl.LightningModule):
         #std = A_k.std()
         #if std < 1e-6:
         #    std = 1.0
-        A_k = (A_k - A_k.mean()) / (A_k.std() + 1e-10)
+        A_k = (A_k - A_k.mean()) / (A_k.std())
         #A_k = (A_k - A_k.mean()) / (std + 1e-10)
         counting_end = time.time()
         counting_time = counting_end - counting_start
-        #self.logger['counting_time'] = counting_end - counting_start
 
         # Update the policy and value networks
         weights_update_start = time.time()
         actor_loss, critic_loss = self.optimize_policy(batch_observations, batch_actions, batch_log_probs, A_k, batch_discounted_rewards)
         weights_update_end = time.time()
         weights_update_time = weights_update_end - weights_update_start
-        #self.logger['weights_update_time'] = weights_update_end - weights_update_start
 
         #log results
         self.log("rollout_time", rollout_time, logger=True)
@@ -256,7 +187,7 @@ class PPO(pl.LightningModule):
         #if iterations_current % self.save_freq == 0:
         if self.current_step % self.save_freq == 0:
             self.save_model()
-        #return loss\
+        #return loss
         return actor_loss + critic_loss
 
     def optimize_policy(self, observations, actions, old_log_probs, advantages, discounted_rewards):
@@ -288,9 +219,6 @@ class PPO(pl.LightningModule):
             critic_loss.backward()
             self.critic_optim.step()
 
-            # Log actor loss
-            #self.logger['actor_losses'].append(actor_loss.detach().cpu())
-
         return actor_loss.detach().cpu(), critic_loss.detach().cpu()
 
     def configure_optimizers(self):
@@ -308,7 +236,7 @@ class PPO(pl.LightningModule):
 
     def on_train_end(self):
         """
-        Actions training
+        Create GIf and print total reward in the end
         """
         frames, total_reward = self.generate_gif_after_training()
         # torch.cuda.empty_cache() ---- where is it
