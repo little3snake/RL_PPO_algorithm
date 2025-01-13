@@ -23,7 +23,7 @@ class RolloutDataset(IterableDataset):
 
     def __iter__(self):
         """
-        Генерация данных: собираем rollout, возвращаем состояния, действия, награды и т.д.
+        Rollout, Return observations, actions, log_probs, discounted_rewards и т.д.
         """
         batch_observations, batch_actions, batch_log_probs = [], [], []
         batch_rewards, batch_lens = [], []
@@ -53,7 +53,6 @@ class RolloutDataset(IterableDataset):
             batch_lens.append(len(episode_rewards))
             batch_rewards.append(episode_rewards)
 
-        # Преобразуем списки в тензоры
         batch_observations = torch.stack(batch_observations).to(self.device)
         batch_actions = torch.stack(batch_actions).to(self.device)
         batch_log_probs = torch.stack(batch_log_probs).to(self.device)
