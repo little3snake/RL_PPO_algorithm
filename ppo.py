@@ -5,10 +5,13 @@ import torch
 import torch.nn as nn
 from torch import dtype
 from torch.optim import Adam
-from torch.distributions import MultivariateNormal
+#from torch.distributions import MultivariateNormal
 from torch.cuda.amp import autocast, GradScaler
 import pytorch_lightning as pl
+from torch.utils.data import IterableDataset, DataLoader
 import time
+
+from rollout_dataset import RolloutDataset
 
 class PPO(pl.LightningModule):
     """
@@ -23,6 +26,7 @@ class PPO(pl.LightningModule):
 
         # Important: This property activates manual optimization.
         self.automatic_optimization = False
+        print ("PPO device", self.device)
 
         self.writer = writer
         #self.save_hyperparameters(**hyperparameters) # Initialize hyperparameters for training with PPO
@@ -37,8 +41,8 @@ class PPO(pl.LightningModule):
         self.env = env
         self.n_observations = env.observation_space.shape[0]
         self.n_actions = env.action_space.shape[0]
-        self.actor = policy_class(self.n_observations, self.n_actions)  # ALG STEP 1
-        self.critic = policy_class(self.n_observations, 1)
+        self.actor = policy_class(self.n_observations, self.n_actions, self.device)  # ALG STEP 1
+        self.critic = policy_class(self.n_observations, 1, self.device)
 
         # Initialize optimizers later
         self.actor_optim = None
@@ -52,8 +56,9 @@ class PPO(pl.LightningModule):
         self.logger_dict = {"actor_losses": []}
 
         # Initialize the covariance matrix for get_action(...), evaluate(...)
-        self.cov_var = torch.full(size=(self.n_actions,), fill_value=0.5)
-        self.cov_mat = torch.diag(self.cov_var)
+        #self.cov_mat = None
+        #self.cov_var = torch.full(size=(self.n_actions,), fill_value=0.5)
+        #self.cov_mat = torch.diag(self.cov_var)
 
         # This logger will help us with printing out summaries of each iteration
         '''self.logger = {
@@ -65,12 +70,12 @@ class PPO(pl.LightningModule):
             'actor_losses': [],     # losses of actor network in current iteration
         }'''
 
-    def on_train_start(self):
+    #def on_train_start(self):
         # Move covariance matrix to device when training starts
-        self.cov_var = self.cov_var.to(self.device)
-        self.cov_mat = self.cov_mat.to(self.device)
+        #self.cov_var = self.cov_var.to(self.device)
+        #self.cov_mat = self.cov_mat.to(self.device)
 
-    def rollout(self):
+    '''def rollout(self):
         batch_observations, batch_actions, batch_log_probs = [], [], []
         batch_rewards, batch_discounted_rewards, batch_lens = [], [], []
         current_timestep = 0
@@ -108,7 +113,7 @@ class PPO(pl.LightningModule):
         self.logger['batch_rewards'] = batch_rewards
         self.logger['batch_lens'] = batch_lens
 
-        return batch_observations, batch_actions, batch_log_probs, batch_discounted_rewards, batch_lens
+        return batch_observations, batch_actions, batch_log_probs, batch_discounted_rewards, batch_lens'''
 
     def compute_discounted_rewards(self, batch_rewards):
         batch_discounted_rewards = []
@@ -119,19 +124,61 @@ class PPO(pl.LightningModule):
                 batch_discounted_rewards.insert(0, discounted_reward)
         return torch.tensor(batch_discounted_rewards, dtype=torch.float)
 
-    def get_action(self, observation):
+    '''def get_action(self, observation):
         mean = self.actor(observation.to(self.device))
         distribution = MultivariateNormal(mean, self.cov_mat)
         action = distribution.sample()
         log_prob = distribution.log_prob(action)
-        return action.detach(), log_prob.detach()
+        return action.detach(), log_prob.detach()'''
 
     def evaluate(self, observations, actions):
         V = self.critic(observations.to(self.device)).squeeze()
-        mean = self.actor(observations.to(self.device)) # actor on device
-        distribution = MultivariateNormal(mean, self.cov_mat) # cov_mat on device
-        log_probs = distribution.log_prob(actions.to(self.device)) # distribution on device
+        print ("obs", observations)
+        print ("actor", self.actor)
+        for param in self.actor.parameters():
+            if torch.isnan(param).any():
+                raise ValueError("Actor parameters contain NaN values.")
+
+        print ("all", self.actor(observations))
+        mean = self.actor(observations.to(self.device))
+        print (mean)
+        # Проверка на NaN в mean
+        if torch.isnan(mean).any():
+            raise ValueError("Mean contains NaN values.")
+        #mean = self.actor(observations.to(self.device)) # actor on device
+        #distribution = MultivariateNormal(mean, self.cov_mat) # cov_mat on device
+        #log_probs = distribution.log_prob(actions.to(self.device)) # distribution on device
+        #print("Observations:", observations)
+        #print("Actions:", actions)
+
+        log_probs = self.actor.evaluate(observations, actions)
         return V, log_probs
+
+    '''def set_cov_mat(self, cov_mat):
+        """
+        Transfer cov matrix.
+        """
+        self.cov_mat = cov_mat'''
+
+    def train_dataloader(self):
+        """
+        Custom RolloutDataset.
+        """
+        dataset = RolloutDataset(
+            env=self.env,
+            actor=self.actor,
+            timesteps_per_batch=self.timesteps_per_batch,
+            max_timesteps_per_episode=self.max_timesteps_per_episode,
+            device=self.device,
+            compute_discounted_rewards=self.compute_discounted_rewards
+        )
+        # Передаем ковариационную матрицу в PPO
+        #self.set_cov_mat(dataset.cov_mat)
+
+        return DataLoader(dataset, batch_size=None, num_workers=0)
+        # return DataLoader(dataset, batch_size=1, num_workers=0)
+        # dataset = RolloutDataset(self.env, self.actor, self.timesteps_per_batch)
+        # return DataLoader(dataset, batch_size=64)
 
 
     '''def save_hyperparameters(self, hyperparameters):
@@ -159,7 +206,8 @@ class PPO(pl.LightningModule):
         #                                         Rollout phase
         # Calculate rollout time
         rollout_start = time.time()
-        batch_observations, batch_actions, batch_log_probs, batch_discounted_rewards, batch_lens = self.rollout() # ALG STEP 3
+        batch_observations, batch_actions, batch_log_probs, batch_discounted_rewards, batch_lens = batch  # ALG STEP 3
+        #batch_observations, batch_actions, batch_log_probs, batch_discounted_rewards, batch_lens = self.rollout() # ALG STEP 3
         rollout_end = time.time()
         rollout_time = rollout_end - rollout_start
         #self.logger['rollout_time'] = rollout_end - rollout_start
@@ -176,7 +224,11 @@ class PPO(pl.LightningModule):
         V, _ = self.evaluate(batch_observations, batch_actions)
         # Compute advantage
         A_k = (batch_discounted_rewards - V.detach()).to(self.device)
+        #std = A_k.std()
+        #if std < 1e-6:
+        #    std = 1.0
         A_k = (A_k - A_k.mean()) / (A_k.std() + 1e-10)
+        #A_k = (A_k - A_k.mean()) / (std + 1e-10)
         counting_end = time.time()
         counting_time = counting_end - counting_start
         #self.logger['counting_time'] = counting_end - counting_start
