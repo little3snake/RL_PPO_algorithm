@@ -2,26 +2,20 @@ import gymnasium as gym
 import torch
 import matplotlib.pyplot as plt
 from matplotlib import animation
-#from torch.utils.tensorboard import SummaryWriter
-#import torch.backends.cudnn as cudnn
 from ppo import PPO
 from network import NN
 
 import pytorch_lightning as pl
 from pytorch_lightning.loggers import TensorBoardLogger
 
-#cudnn.benchmark = True
-
 device = torch.device(
     "cuda" if torch.cuda.is_available() else
     "mps" if torch.backends.mps.is_available() else
     "cpu"
 )
-#torch.cuda.set_per_process_memory_fraction(0.85)  # Использовать не более 85% памяти
-
-#writer = SummaryWriter(
-#    log_dir=r"C:\Users\user\Python ML\PyTorch\BipedalWalker_ppo_PTorch\logs_ppo\ppo_pt_bipedal_walker_logs"
-#)
+writer = SummaryWriter(
+    log_dir=r"C:\Users\user\Python ML\PyTorch\BipedalWalker_ppo_PTorch\logs_ppo\ppo_pt_bipedal_walker_logs"
+)
 logger = TensorBoardLogger("logs", name="ppo_training")
 
 
@@ -35,36 +29,6 @@ def save_frames_as_gif(frames, path='./', filename='bipedalWalker_ppo_PT_post_tr
 
     anim = animation.FuncAnimation(plt.gcf(), animate, frames=len(frames), interval=50)
     anim.save(path + filename, writer='imagemagick', fps=60)
-
-
-'''def train(env_name, hyperparameters, device=torch.device('cpu'), writer=None):
-    """
-    Trains the model.
-
-    Parameters:
-      env_name - the name of the environment to train on
-      hyperparameters - a dict of hyperparameters to use, defined in main
-
-    Return:
-      None
-    """
-    print(f"Training", flush=True)  # Immediate printing
-    print(device)
-
-    # Создаём среду внутри функции
-    #env = gym.make(env_name, render_mode='rgb_array')
-
-    model = PPO(policy_class=NN, env=env, device=device, writer=writer, **hyperparameters)
-
-    frames, total_reward = model.learn(total_timesteps=500_000)
-
-    save_frames_as_gif(frames)
-    print('total reward trained model =', total_reward)
-
-    # Закрываем среду и освобождаем память
-    #env.close()
-    torch.cuda.empty_cache()'''
-
 
 if __name__ == "__main__":
     #Optim hyperparams (find via optuna)
