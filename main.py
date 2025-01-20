@@ -4,6 +4,9 @@ import matplotlib.pyplot as plt
 from matplotlib import animation
 from ppo import PPO
 from network import NN
+from torch.utils.tensorboard import SummaryWriter
+
+
 
 import pytorch_lightning as pl
 from pytorch_lightning.loggers import TensorBoardLogger
