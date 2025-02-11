@@ -3,33 +3,19 @@ import time
 import numpy as np
 import torch
 import torch.nn as nn
-from torch import dtype
+#from torch import dtype
 from torch.optim import Adam
 from torch.distributions import MultivariateNormal
-from torch.cuda.amp import autocast, GradScaler
+from torch.distributed import all_reduce, ReduceOp
+#from torch.cuda.amp import autocast, GradScaler
 #from multiprocessing import Pool, cpu_count
-import time
-
-
+#import time
 
 class PPO:
     """
     This is the PPO class we will use as our model in main.py
     """
-
     def __init__(self, policy_class, env, device, writer, **hyperparameters):
-        """
-        Initializes the PPO model, including hyperparameters.
-
-        Parameters:
-            policy_class - the policy class to use for our actor/critic networks.
-            env - the environment to train on.
-            device - cuda, mps or cpu
-            hyperparameters - all extra arguments passed into PPO that should be hyperparameters.
-
-        Returns:
-            None
-        """
         # Make sure the environment is compatible with our code
         assert isinstance(env.observation_space, gym.spaces.Box)
         assert isinstance(env.action_space, gym.spaces.Box)
@@ -64,17 +50,6 @@ class PPO:
         }
 
     def learn(self, total_timesteps):
-        """
-        Train the actor and critic networks. Here is where the main PPO algorithm resides.
-
-        Parameters:
-            total_timesteps - the total number of timesteps to train for
-            writer - a TensorBoard writer object (SummaryWriter for logging metrics)
-
-        Return:
-            frames - list of frames for gif
-            total_reward - total reward of the trained model
-        """
         timesteps_current = 0
         iterations_current = 0
 
@@ -125,10 +100,23 @@ class PPO:
 
                 self.actor_optim.zero_grad(set_to_none=True) # better than simple .zero_grad()
                 actor_loss.backward()
-                self.actor_optim.step()
+                #self.actor_optim.step()
                 # Calculate gradients and perform backward propagation for critic network
                 self.critic_optim.zero_grad(set_to_none=True) # better than simple .zero_grad()
                 critic_loss.backward()
+                #self.critic_optim.step()
+                # Синхронизация градиентов
+                for param in self.actor.parameters():
+                    if param.grad is not None:
+                        all_reduce(param.grad, op=ReduceOp.SUM)
+                        param.grad /= dist.get_world_size()
+
+                for param in self.critic.parameters():
+                    if param.grad is not None:
+                        all_reduce(param.grad, op=ReduceOp.SUM)
+                        param.grad /= dist.get_world_size()
+
+                self.actor_optim.step()
                 self.critic_optim.step()
 
                 # Log actor loss
@@ -160,24 +148,10 @@ class PPO:
             done = terminated or truncated
 
         torch.cuda.empty_cache()
-        print ("before return in learn")
+        #print ("before return in learn")
         return frames, total_reward
 
     def rollout(self):
-        """
-        This is where we collect the fresh batch of data
-        from simulation (on-policy algorithm).
-
-        Parameters:
-            None
-
-        Return:
-            batch_observations - Shape: (number of timesteps, dimension of observation)
-            batch_actions - Shape: (number of timesteps, dimension of action)
-            batch_log_probs - the log probabilities of each action taken this batch. Shape: (number of timesteps)
-            batch_discounted_rewards - the discounted rewards of each timestep in this batch. Shape: (number of timesteps)
-            batch_lens - the lengths of each episode this batch. Shape: (number of episodes)
-        """
         batch_observations, batch_actions, batch_log_probs = [], [], []
         batch_rewards, batch_discounted_rewards, batch_lens = [], [], []
         current_timestep = 0
@@ -194,10 +168,6 @@ class PPO:
                 batch_observations.append(observation)
                 with torch.no_grad():
                     action, log_prob = self.get_action(observation)
-                #action = action.clone().detach().to(dtype=torch.float, device=self.device)
-                #log_prob = log_prob.clone().detach().to(dtype=torch.float, device=self.device)
-
-                #action, log_prob = self.get_action(torch.tensor(observation, dtype=torch.float).to(self.device))
                 observation, reward, terminated, truncated, _ = self.env.step(action.cpu().numpy())
                 observation = torch.tensor(observation, dtype=torch.float, device=self.device)
                 episode_rewards.append(reward)
@@ -223,15 +193,6 @@ class PPO:
         return batch_observations, batch_actions, batch_log_probs, batch_discounted_rewards, batch_lens
 
     def compute_discounted_rewards(self, batch_rewards):
-        """
-        Compute the discounted rewards of each timestep in a batch given the rewards.
-
-        Parameters:
-            batch_rewards - the rewards in a batch, Shape: (number of episodes, number of timesteps per episode)
-
-        Return:
-            batch_discounted_rewards - the rewards to go, Shape: (number of timesteps in batch)
-        """
         batch_discounted_rewards = []
 
         for episode_rews in reversed(batch_rewards):
@@ -245,20 +206,6 @@ class PPO:
         return torch.tensor(batch_discounted_rewards, dtype=torch.float)
 
     def get_action(self, observation):
-        """
-        Queries an action from the actor network, should be called from rollout.
-
-        Parameters:
-            observation - the observation at the current timestep
-
-        Return:
-            action - the action to take, as a numpy array
-            log_prob - the log probability of the selected action in the distribution
-        """
-        #if not isinstance(observation, torch.Tensor):
-        #    observation = torch.tensor(observation, dtype=torch.float, device=device)
-        #observation = observation.unsqueeze(0)
-
         #with torch.no_grad():
         mean = self.actor(observation)
         distribution = MultivariateNormal(mean, self.cov_mat)
@@ -268,26 +215,7 @@ class PPO:
         return action.detach(), log_prob.detach()
 
     def evaluate(self, batch_observations, batch_actions):
-        """
-        Estimate the values of each observation, and the log probs of
-        each action in the most recent batch with the most recent
-        iteration of the actor network. Should be called from learn.
-
-        Parameters:
-            batch_observations - the observations from the most recently collected batch as a tensor.
-                  Shape: (number of timesteps in batch, dimension of observation)
-            batch_actions - the actions from the most recently collected batch as a tensor.
-                  Shape: (number of timesteps in batch, dimension of action)
-
-        Return:
-            V - the predicted values of batch_obs
-            log_probs - the log probabilities of the actions taken in batch_acts given batch_obs
-        """
-        #batch_observations = batch_observations.to(device)
-        #batch_actions = batch_actions.to(device)
-
         V = self.critic(batch_observations).squeeze()
-
         mean = self.actor(batch_observations) # actor on device
         distribution = MultivariateNormal(mean, self.cov_mat) # cov_mat on device
         log_probs = distribution.log_prob(batch_actions) # distribution on device
@@ -295,15 +223,6 @@ class PPO:
         return V, log_probs
 
     def _init_hyperparameters(self, hyperparameters):
-        """
-        Initialize default and custom values for hyperparameters
-
-        Parameters:
-            hyperparameters
-
-        Return:
-            None
-        """
         self.timesteps_per_batch = 4800
         self.max_timesteps_per_episode = 1200
         self.n_updates_per_iteration = 15
@@ -316,15 +235,6 @@ class PPO:
             exec('self.' + param + ' = ' + str(val))
 
     def _log_summary(self):
-        """
-        Print to stdout what we've logged so far in the most recent batch.
-
-        Parameters:
-            None
-
-        Return:
-            None
-        """
         delta_t = self.logger['delta_t']
         self.logger['delta_t'] = time.time_ns()
         delta_t = (self.logger['delta_t'] - delta_t) / 1e9
