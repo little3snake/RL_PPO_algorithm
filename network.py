@@ -1,11 +1,6 @@
-"""
-  This file contains a neural network module for us to
-  define our actor and critic networks in PPO.
-"""
 import torch
 from torch import nn
 import torch.nn.functional as F
-import numpy as np
 
 class NN(nn.Module):
   def __init__(self, input_dim, output_dim):
