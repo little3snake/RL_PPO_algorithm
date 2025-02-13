@@ -7,324 +7,223 @@ from torch import dtype
 from torch.optim import Adam
 from torch.distributions import MultivariateNormal
 from torch.cuda.amp import autocast, GradScaler
-#from multiprocessing import Pool, cpu_count
-import time
-
-
+import torch.distributed as dist
 
 class PPO:
-    """
-    This is the PPO class we will use as our model in main.py
-    """
-
-    def __init__(self, policy_class, env, device, writer, **hyperparameters):
-        """
-        Initializes the PPO model, including hyperparameters.
-
-        Parameters:
-            policy_class - the policy class to use for our actor/critic networks.
-            env - the environment to train on.
-            device - cuda, mps or cpu
-            hyperparameters - all extra arguments passed into PPO that should be hyperparameters.
-
-        Returns:
-            None
-        """
-        # Make sure the environment is compatible with our code
-        assert isinstance(env.observation_space, gym.spaces.Box)
-        assert isinstance(env.action_space, gym.spaces.Box)
-
+    def __init__(self, policy_class, envs, device, rank=0, writer=None, **kwargs):
         self.device = device
+        self.world_size = kwargs.get("world_size", 1)
+        self.rank = rank
         self.writer = writer
-        # Initialize hyperparameters for training with PPO
-        self._init_hyperparameters(hyperparameters)
+        self.seed = kwargs.get("seed", 1)
 
-        self.env = env
-        self.n_observations = env.observation_space.shape[0]
-        self.n_actions = env.action_space.shape[0]
+        self.num_steps = kwargs.get("num_steps", 1) # rollout steps for 1 process per batch
+        self.gamma = kwargs.get("gamma", 0.99421)
+        self.local_num_envs = kwargs.get("local_num_envs", 1)
+        self.num_iterations = kwargs.get("num_iterations", 1)
+        self.num_envs = kwargs.get("num_envs", 1) # in rollout
+        self.update_epochs = kwargs.get("update_epochs", 1)
+        self.clip = kwargs.get("clip", 0.2)
+        self.learning_rate = kwargs.get("learning_rate", 3e-4)
+        self.save_freq = kwargs.get("save_freq", 10)
+
+        self.envs = envs
+        self.n_observations = envs.single_observation_space.shape[0]
+        self.n_actions = envs.single_action_space.shape[0]
         self.actor = policy_class(self.n_observations, self.n_actions).to(self.device)  # ALG STEP 1
         self.critic = policy_class(self.n_observations, 1).to(self.device)
-
         # Initialize optimizers for actor and critic
-        self.actor_optim = Adam(self.actor.parameters(), lr=self.learning_rate)
+        self.actor_optim = Adam(self.actor.parameters(), lr=self.learning_rate) # eps=1e-5
         self.critic_optim = Adam(self.critic.parameters(), lr=self.learning_rate)
 
         # Initialize the covariance matrix for get_action(...), evaluate(...)
         self.cov_var = torch.full(size=(self.n_actions,), fill_value=0.5).to(self.device)
         self.cov_mat = torch.diag(self.cov_var).to(self.device)
 
-        # This logger will help us with printing out summaries of each iteration
-        self.logger = {
-            'delta_t': time.time_ns(),
-            'timesteps_current': 0,
-            'iterations_current': 0,
-            'batch_lens': [],
-            'batch_rewards': [],    # episodic returns
-            'actor_losses': [],     # losses of actor network in current iteration
-        }
+        self.zeros_init()
 
-    def learn(self, total_timesteps):
-        """
-        Train the actor and critic networks. Here is where the main PPO algorithm resides.
+        if self.world_size > 1:
+            for param in self.actor.parameters():
+                dist.broadcast(param.data, src=0)
+            for param in self.critic.parameters():
+                dist.broadcast(param.data, src=0)
+        # For root
+        if self.rank == 0:
+            self.logger = {
+                'delta_t': time.time_ns(),
+                'timesteps_current': 0,
+                'iterations_current': 0,
+                'batch_lens': [],
+                'batch_rewards': [],    # episodic returns
+                'actor_losses': [],     # losses of actor network in current iteration
+            }
 
-        Parameters:
-            total_timesteps - the total number of timesteps to train for
-            writer - a TensorBoard writer object (SummaryWriter for logging metrics)
+    def zeros_init(self):
+        self.observations = torch.zeros((self.num_steps, self.local_num_envs) + self.envs.single_observation_space.shape).to(self.device)
+        self.actions = torch.zeros((self.num_steps, self.local_num_envs) + self.envs.single_action_space.shape).to(self.device)
+        self.logprobs = torch.zeros((self.num_steps, self.local_num_envs)).to(self.device)
+        self.rewards = torch.zeros((self.num_steps, self.local_num_envs)).to(self.device)
+        self.dones = torch.zeros((self.num_steps, self.local_num_envs)).to(self.device)
+        self.discounted_rewards = torch.zeros_like(self.rewards).to(self.device)
+        self.global_step = 0
 
-        Return:
-            frames - list of frames for gif
-            total_reward - total reward of the trained model
-        """
-        timesteps_current = 0
-        iterations_current = 0
+    def learn(self):
+        self.global_step = 0
+        start_time = time.time()
+        obs, _ = self.envs.reset(seed=self.seed)
+        obs = torch.Tensor(obs).to(self.device)
+        done = torch.zeros(self.local_num_envs).to(self.device)
+        #print(obs)
 
-        while timesteps_current < total_timesteps:
-            # Calculate rollout time
-            rollout_start = time.time()
-            # Collecting batch data
-            batch_observations, batch_actions, batch_log_probs, batch_discounted_rewards, batch_lens = \
-                self.rollout()  # ALG STEP 3
-            rollout_end = time.time()
-            self.logger['rollout_time'] = rollout_end - rollout_start
+        for i in range(1, self.num_iterations + 1):
+            #                          ROLLOUT (without values)
+            #batch_lens = self.rollout(obs, done, i)  # ALG STEP 3
+            self.rollout(obs, done, i)  # ALG STEP 3
+            #                                   COMPUTING A_K AND v
+            V, _ = self.evaluate()
+            A_k = (self.discounted_rewards - V.detach()).to(self.device)
+            if A_k.numel() > 1:  # Проверка, что в A_k больше одного элемента
+                A_k = (A_k - A_k.mean()) / (A_k.std() + 1e-10)
+            else:
+                A_k = torch.zeros_like(A_k)  # Если данных недостаточно, обнуляем A_k
+            #A_k = (A_k - A_k.mean()) / (A_k.std() + 1e-10)
 
-            # Calculate how many timesteps we collected this batch
-            timesteps_current += np.sum(batch_lens)
-            iterations_current += 1
-            self.logger['timesteps_current'] = timesteps_current
-            self.logger['iterations_current'] = iterations_current
+            if self.rank == 0:
+                self.update_model(A_k) # ALG STEP 6 & 7
 
-            # Calculate counting A_k and V time
-            counting_start = time.time()
-            # Calculate advantage at k-th iteration
-            V, _ = self.evaluate(batch_observations, batch_actions)
-            A_k = (batch_discounted_rewards - V.detach()).to(self.device)
-            # Normalizing advantages
-            A_k = (A_k - A_k.mean()) / (A_k.std() + 1e-10)
-            counting_end = time.time()
-            self.logger['counting_time'] = counting_end - counting_start
+            if self.rank == 0:
+                self._log_summary()
+            #self._log_summary()
 
-            # Calculate weight_update time
-            weights_update_start = time.time()
-            # Update network for some n epochs
-            for _ in range(self.n_updates_per_iteration):  # ALG STEP 6 & 7
-                # Calculate V_phi and pi_theta(a_t | s_t)
-                V, current_log_probs = self.evaluate(batch_observations, batch_actions)
-
-                # Calculate the ratio pi_theta(a_t | s_t) / pi_theta_k(a_t | s_t)
-                ratios = torch.exp(current_log_probs - batch_log_probs)
-
-                 # Calculate parts of clip loss
-                #clip_loss_1part = ratios * A_k
-                #clip_loss_2part = torch.clamp(ratios, 1 - self.clip, 1 + self.clip) * A_k
-                clip_loss = torch.min(ratios * A_k, torch.clamp(ratios, 1 - self.clip, 1 + self.clip) * A_k)
-
-                # Calculate actor and critic losses
-                actor_loss = -clip_loss.mean()
-                #actor_loss = (-torch.min(clip_loss_1part, clip_loss_2part)).mean()
-                critic_loss = nn.MSELoss()(V, batch_discounted_rewards)
-
-                self.actor_optim.zero_grad(set_to_none=True) # better than simple .zero_grad()
-                actor_loss.backward()
-                self.actor_optim.step()
-                # Calculate gradients and perform backward propagation for critic network
-                self.critic_optim.zero_grad(set_to_none=True) # better than simple .zero_grad()
-                critic_loss.backward()
-                self.critic_optim.step()
-
-                # Log actor loss
-                self.logger['actor_losses'].append(actor_loss.detach().cpu())
-
-            weights_update_end = time.time()
-            self.logger['weights_update_time'] = weights_update_end - weights_update_start
-            # Log training summary
-            self._log_summary()
-
-            # Save model
-            if iterations_current % self.save_freq == 0:
+            if self.rank == 0 and i % self.save_freq == 0:
                 torch.save(self.actor.state_dict(), './ppo_actor.pth')
                 torch.save(self.critic.state_dict(), './ppo_critic.pth')
 
+            # TRY NOT TO MODIFY: record rewards for plotting purposes
+            if self.rank == 0:
+                self.writer.add_scalar("charts/learning_rate", self.actor_optim.param_groups[0]["lr"], self.global_step)
+                print("SPS:", int(self.global_step / (time.time() - start_time)))
+                self.writer.add_scalar("charts/SPS", int(self.global_step / (time.time() - start_time)), self.global_step)
 
-        # Generate gif after learning
-        obs, _ = self.env.reset()
-        frames = []
-        total_reward = 0
-        done = False
-        while not done:
-            frame = self.env.render()
-            frames.append(frame)
-            obs = torch.tensor(obs, dtype=torch.float).to(self.device)
-            action, _ = self.get_action(obs)
-            obs, reward, terminated, truncated, _ = self.env.step(action.cpu().numpy())
-            total_reward += reward
-            done = terminated or truncated
+        # creating a gif
+        if self.rank == 0:
+            frames, total_reward = self.create_gif()
+            print ("before return in learn")
+            #print(type(frames))  # Проверяем тип данных
+            #print(frames)  # Проверяем содержимое
+            return list(frames), total_reward
 
-        torch.cuda.empty_cache()
-        print ("before return in learn")
-        return frames, total_reward
 
-    def rollout(self):
-        """
-        This is where we collect the fresh batch of data
-        from simulation (on-policy algorithm).
+    def rollout(self, obs, done, iteration):
+        for step in range (0, self.num_steps):
+            self.global_step += self.num_envs
+            print(obs[self.rank].shape) # shape [2,24]
+            print (self.observations[step].shape) # shape 1 [1,24]
+            #self.observations[step] = obs - initial code
+            self.observations[step] = obs[self.rank] # my code
+            self.dones[step] = done
+            with torch.no_grad():
+                action, log_prob = self.get_action(obs)
+            obs, reward, terminated, truncated, infos = self.envs.step(action.cpu().numpy())
+            self.rewards[step] = torch.tensor(reward).to(self.device).view(-1) # to 1dim tensor
+            self.actions[step] = action
+            self.logprobs[step] = log_prob
+            done = np.logical_or(terminated, truncated)
+            obs = torch.tensor(obs).to(self.device)
+            done = torch.tensor(done).to(self.device)
+            if self.rank == 0 and "final_info" in infos:
+                for info in infos["final_info"]:
+                    if info and "episode" in info: # find information about episode (and info exist)
+                        print(f"global_step={self.global_step}, episodic_return={info['episode']['r']}")
+                        self.writer.add_scalar("charts/episodic_return", info["episode"]["r"], self.global_step)
+                        self.writer.add_scalar("charts/episodic_length", info["episode"]["l"], self.global_step)
+        print(
+            f"local_rank: {self.rank}, action.sum(): {action.sum()}, iteration: {iteration}, "
+            f"agent.actor.weight.sum(): {sum(p.sum() for p in self.actor.parameters() if p.requires_grad)}"
+        )
+        #  COMPUTE DISCOUNTED REWARD
+        self.compute_discounted_rewards()
+        #return batch_lens
 
-        Parameters:
-            None
+    def compute_discounted_rewards(self):
+        discounted_reward_t = torch.zeros(self.local_num_envs).to(self.device)
+        for t in reversed(range(self.num_steps)):
+            # If the episode is done, reset the discounted reward
+            discounted_reward_t = self.rewards[t] + self.gamma * discounted_reward_t * (1 - self.dones[t])
+            self.discounted_rewards[t] = discounted_reward_t
+        #return batch_discounted_rewards
 
-        Return:
-            batch_observations - Shape: (number of timesteps, dimension of observation)
-            batch_actions - Shape: (number of timesteps, dimension of action)
-            batch_log_probs - the log probabilities of each action taken this batch. Shape: (number of timesteps)
-            batch_discounted_rewards - the discounted rewards of each timestep in this batch. Shape: (number of timesteps)
-            batch_lens - the lengths of each episode this batch. Shape: (number of episodes)
-        """
-        batch_observations, batch_actions, batch_log_probs = [], [], []
-        batch_rewards, batch_discounted_rewards, batch_lens = [], [], []
-        current_timestep = 0
-
-        while current_timestep < self.timesteps_per_batch:
-            episode_rewards = []
-            observation, _ = self.env.reset()  # Reset the environment
-            observation = torch.tensor(observation, dtype=torch.float, device=self.device)
-            done = False
-            timestep_start = current_timestep
-
-            for _ in range(self.max_timesteps_per_episode):
-                current_timestep += 1
-                batch_observations.append(observation)
-                with torch.no_grad():
-                    action, log_prob = self.get_action(observation)
-                #action = action.clone().detach().to(dtype=torch.float, device=self.device)
-                #log_prob = log_prob.clone().detach().to(dtype=torch.float, device=self.device)
-
-                #action, log_prob = self.get_action(torch.tensor(observation, dtype=torch.float).to(self.device))
-                observation, reward, terminated, truncated, _ = self.env.step(action.cpu().numpy())
-                observation = torch.tensor(observation, dtype=torch.float, device=self.device)
-                episode_rewards.append(reward)
-                batch_actions.append(action)
-                batch_log_probs.append(log_prob)
-                if terminated or truncated:
-                    break
-
-            batch_lens.append(len(episode_rewards))
-            batch_rewards.append(episode_rewards)
-
-        #batch_observations = torch.tensor(batch_observations, dtype=torch.float).to(self.device)
-        batch_observations = torch.stack(batch_observations).to(self.device)
-        #batch_actions = torch.stack(batch_actions).to(self.device)
-        batch_actions = torch.stack(batch_actions).to(self.device)
-        #batch_log_probs = torch.stack(batch_log_probs).to(self.device)
-        batch_log_probs = torch.stack(batch_log_probs).to(self.device)
-        batch_discounted_rewards = self.compute_discounted_rewards(batch_rewards).to(self.device)
-
-        self.logger['batch_rewards'] = batch_rewards
-        self.logger['batch_lens'] = batch_lens
-
-        return batch_observations, batch_actions, batch_log_probs, batch_discounted_rewards, batch_lens
-
-    def compute_discounted_rewards(self, batch_rewards):
-        """
-        Compute the discounted rewards of each timestep in a batch given the rewards.
-
-        Parameters:
-            batch_rewards - the rewards in a batch, Shape: (number of episodes, number of timesteps per episode)
-
-        Return:
-            batch_discounted_rewards - the rewards to go, Shape: (number of timesteps in batch)
-        """
-        batch_discounted_rewards = []
-
-        for episode_rews in reversed(batch_rewards):
-            discounted_reward = 0
-            #episode_discounted_reward = []
-            for rew in reversed(episode_rews):
-                discounted_reward = rew + discounted_reward * self.gamma
-                batch_discounted_rewards.insert(0, discounted_reward)
-            #batch_discounted_rewards.extend(episode_discounted_reward)
-        #batch_discounted_rewards = torch.tensor(batch_discounted_rewards, dtype=torch.float, device=device)
-        return torch.tensor(batch_discounted_rewards, dtype=torch.float)
-
+    #for actor
     def get_action(self, observation):
-        """
-        Queries an action from the actor network, should be called from rollout.
-
-        Parameters:
-            observation - the observation at the current timestep
-
-        Return:
-            action - the action to take, as a numpy array
-            log_prob - the log probability of the selected action in the distribution
-        """
-        #if not isinstance(observation, torch.Tensor):
-        #    observation = torch.tensor(observation, dtype=torch.float, device=device)
-        #observation = observation.unsqueeze(0)
-
-        #with torch.no_grad():
         mean = self.actor(observation)
         distribution = MultivariateNormal(mean, self.cov_mat)
         action = distribution.sample()
         log_prob = distribution.log_prob(action)
-
         return action.detach(), log_prob.detach()
 
-    def evaluate(self, batch_observations, batch_actions):
-        """
-        Estimate the values of each observation, and the log probs of
-        each action in the most recent batch with the most recent
-        iteration of the actor network. Should be called from learn.
-
-        Parameters:
-            batch_observations - the observations from the most recently collected batch as a tensor.
-                  Shape: (number of timesteps in batch, dimension of observation)
-            batch_actions - the actions from the most recently collected batch as a tensor.
-                  Shape: (number of timesteps in batch, dimension of action)
-
-        Return:
-            V - the predicted values of batch_obs
-            log_probs - the log probabilities of the actions taken in batch_acts given batch_obs
-        """
-        #batch_observations = batch_observations.to(device)
-        #batch_actions = batch_actions.to(device)
-
+    #for critic
+    def evaluate(self):
+        batch_observations = self.observations.view(-1, self.n_observations)
+        batch_actions = self.actions.view(-1, self.n_actions)
         V = self.critic(batch_observations).squeeze()
-
-        mean = self.actor(batch_observations) # actor on device
-        distribution = MultivariateNormal(mean, self.cov_mat) # cov_mat on device
-        log_probs = distribution.log_prob(batch_actions) # distribution on device
-
+        mean = self.actor(batch_observations)
+        distribution = MultivariateNormal(mean, self.cov_mat)
+        log_probs = distribution.log_prob(batch_actions)
         return V, log_probs
 
-    def _init_hyperparameters(self, hyperparameters):
-        """
-        Initialize default and custom values for hyperparameters
+    def update_model(self, A_k):
+        for _ in range(self.update_epochs):
+            V, current_log_probs = self.evaluate()
+            ratios = torch.exp(current_log_probs - self.logprobs.view(-1))
+            # clip_loss_1part = ratios * A_k
+            # clip_loss_2part = torch.clamp(ratios, 1 - self.clip, 1 + self.clip) * A_k
+            clip_loss = torch.min(ratios * A_k, torch.clamp(ratios, 1 - self.clip, 1 + self.clip) * A_k)
+            actor_loss = -clip_loss.mean()
+            # actor_loss = (-torch.min(clip_loss_1part, clip_loss_2part)).mean()
+            #critic_loss = nn.MSELoss()(V, self.discounted_rewards.view(-1))
+            critic_loss = nn.MSELoss()(V.view(-1), self.discounted_rewards.view(-1))
 
-        Parameters:
-            hyperparameters
+            self.actor_optim.zero_grad(set_to_none=True)
+            actor_loss.backward()
+            self.critic_optim.zero_grad(set_to_none=True)
+            critic_loss.backward()
 
-        Return:
-            None
-        """
-        self.timesteps_per_batch = 4800
-        self.max_timesteps_per_episode = 1200
-        self.n_updates_per_iteration = 15
-        self.learning_rate = 0.000429
-        self.gamma = 0.994
-        self.clip = 0.28
-        self.save_freq = 10
+            if self.world_size > 1:
+                actor_grads = torch.nn.utils.parameters_to_vector(
+                    [p.grad for p in self.actor.parameters() if p.grad is not None])
+                dist.all_reduce(actor_grads, op=dist.ReduceOp.SUM)
+                actor_grads /= self.world_size
+                torch.nn.utils.vector_to_parameters(actor_grads,
+                                                    [p.grad for p in self.actor.parameters() if p.grad is not None])
 
-        for param, val in hyperparameters.items():
-            exec('self.' + param + ' = ' + str(val))
+                critic_grads = torch.nn.utils.parameters_to_vector(
+                    [p.grad for p in self.critic.parameters() if p.grad is not None])
+                dist.all_reduce(critic_grads, op=dist.ReduceOp.SUM)
+                critic_grads /= self.world_size
+                torch.nn.utils.vector_to_parameters(critic_grads, [p.grad for p in self.critic.parameters() if
+                                                                   p.grad is not None])
+
+            self.actor_optim.step()
+            self.critic_optim.step()
+
+    def create_gif (self):
+        obs, _ = self.envs.reset()
+        frames = []
+        total_reward = 0
+        done = False
+        while not done:
+            frame = self.envs.render()
+            frames.append(frame[0])
+            obs = torch.tensor(obs, dtype=torch.float).to(self.device)
+            action, _ = self.get_action(obs)
+            obs, reward, terminated, truncated, _ = self.envs.step(action.cpu().numpy())
+            total_reward += reward
+            done = terminated or truncated
+        # torch.cuda.empty_cache()
+        #print("before return in learn")
+        return frames, total_reward
 
     def _log_summary(self):
-        """
-        Print to stdout what we've logged so far in the most recent batch.
-
-        Parameters:
-            None
-
-        Return:
-            None
-        """
         delta_t = self.logger['delta_t']
         self.logger['delta_t'] = time.time_ns()
         delta_t = (self.logger['delta_t'] - delta_t) / 1e9
