@@ -19,41 +19,41 @@ from network import NN
 
 @dataclass
 class Args:
-    #def __init__(self):
-    exp_name = os.path.basename(__file__)[: -len(".py")]
-    seed = 1
-    torch_deterministic = True # fixed order - in input1 = input2 -> output1 = output2
-    cuda = True
-    track = False # tracking metrics (in wandb)
-    wandb_project_name = "PPO_PyTorch_distributed"
-    wandb_entity = None # the name of the user/group
-    #capture_gif = False
-    capture_video = False
-    env_name = "BipedalWalker-v3"
-    total_timesteps = 100_000
-    learning_rate = 0.0004755
-    gamma = 0.99421
-    clip = 0.286
-    local_num_envs = 2
-    num_steps = 4096// local_num_envs # before updating - timesteps_per_batch / local_num_envs
-    num_minibatches = 4 # the number of minibatches for one updating
-    update_epochs = 18 # 4 - oridinally -- n_updates_per_iteration
-    max_timesteps_per_episode = 1600
-    max_grad_norm: float = 0.5
-    device_ids: List[int] = field(default_factory=lambda: [])
-    backend = "gloo"  # "nccl" # gloo
-    #init in runtime
-    world_size = 1
-    #local_batch_size: int = 0
-    #local_minibatch_size: int = 0
-    num_envs: int = 0
-    batch_size: int = 0
-    #minibatch_size: int = 0
-    num_iterations: int = 0
+    def __init__(self):
+        self.exp_name = os.path.basename(__file__)[: -len(".py")]
+        self.seed = 1
+        self.torch_deterministic = True # fixed order - in input1 = input2 -> output1 = output2
+        self.cuda = True
+        self.track = False # tracking metrics (in wandb)
+        self.wandb_project_name = "PPO_PyTorch_distributed"
+        self.wandb_entity = None # the name of the user/group
+        #capture_gif = False
+        self.capture_video = False
+        self.env_name = "BipedalWalker-v3"
+        self.total_timesteps = 100_000
+        self.learning_rate = 0.0004755
+        self.gamma = 0.99421
+        self.clip = 0.286
+        self.local_num_envs = 2
+        self.num_steps = 4096// self.local_num_envs # before updating - timesteps_per_batch / local_num_envs
+        self.num_minibatches = 4 # the number of minibatches for one updating
+        self.update_epochs = 18 # 4 - oridinally -- n_updates_per_iteration
+        self.max_timesteps_per_episode = 1600
+        self.max_grad_norm: float = 0.5
+        #self.device_ids: List[int] = field(default_factory=lambda: [])
+        self.backend = "gloo"  # "nccl" # gloo
+        #init in runtime
+        self.world_size = 1
+        #local_batch_size: int = 0
+        #local_minibatch_size: int = 0
+        self.num_envs: int = 0
+        self.batch_size: int = 0
+        #minibatch_size: int = 0
+        self.num_iterations: int = 0
 
 
 
-'''def init_distributed(args):
+def init_distributed(args):
     local_rank = int(os.getenv("LOCAL_RANK", "0"))
     args.world_size = int(os.getenv("WORLD_SIZE", "1"))
     if args.world_size > 1:
@@ -66,7 +66,7 @@ class Args:
     args.batch_size = int(args.num_envs * args.num_steps)  # total batch size (total envs * num_steps_per_1_iter)
     #args.minibatch_size = int(args.batch_size // args.num_minibatches)  # total minibatch size
     args.num_iterations = args.total_timesteps // args.batch_size
-    return local_rank'''
+    return local_rank
 
 def make_env(env_name, id, capture_video, run_name):
     def thunk ():
@@ -94,23 +94,8 @@ def save_frames_as_gif(frames, path='./', filename='bipedalWalker_ppo_PT_post_tr
     anim.save(path + filename, writer='imagemagick', fps=60)
 
 if __name__ == "__main__":
-    args = tyro.cli(Args)
-    local_rank = int(os.getenv("LOCAL_RANK", "0"))
-    args.world_size = int(os.getenv("WORLD_SIZE", "1"))
-    # args.local_batch_size = int(args.local_num_envs * args.num_steps)  # for each process
-    # args.local_minibatch_size = int(args.local_batch_size // args.num_minibatches)  # for gradient descent
-    args.num_envs = args.local_num_envs * args.world_size  # total number of envs
-    args.batch_size = int(args.num_envs * args.num_steps)  # total batch size (total envs * num_steps_per_1_iter)
-    # args.minibatch_size = int(args.batch_size // args.num_minibatches)  # total minibatch size
-    args.num_iterations = args.total_timesteps // args.batch_size
-
-    if args.world_size > 1:
-        dist.init_process_group(args.backend, rank=local_rank, world_size=args.world_size)
-    else:
-        warnings.warn("Running in non-distributed mode!")
-
-    #args = Args()
-    #local_rank = init_distributed(args)
+    args = Args()
+    local_rank = init_distributed(args)
     #device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() and args.cuda else "cpu")
 
     run_name = f"{args.env_name}__{args.exp_name}__{args.seed}__{int(time.time())}"  # for loggind and saving results
@@ -142,14 +127,14 @@ if __name__ == "__main__":
         assert len(args.device_ids) == args.world_size, "you must specify the same number of device ids as `--nproc_per_node`"
         device = torch.device(f"cuda:{args.device_ids[local_rank]}" if torch.cuda.is_available() and args.cuda else "cpu")
     else:'''
-    #device_count = torch.cuda.device_count()
+    device_count = torch.cuda.device_count()
     #print ("device_count ", device_count)
-    #if device_count < args.world_size:
-    #    device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
-    #    #print ("if ",device)
-    #else:
-    #    device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() and args.cuda else "cpu")
-    #    #print("else ", device)
+    if device_count < args.world_size:
+        device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
+        #print ("if ",device)
+    else:
+        device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() and args.cuda else "cpu")
+        #print("else ", device)
 
     # Set unique seed per process
     args.seed += local_rank
@@ -158,7 +143,7 @@ if __name__ == "__main__":
     torch.manual_seed(args.seed - local_rank) # originally - _seed(args.seed)
     torch.backends.cudnn.deterministic = args.torch_deterministic
 
-    if args.device_ids:
+    '''if args.device_ids:
         assert len(args.device_ids) == args.world_size, "you must specify the same number of device ids as `--nproc_per_node`"
         device = torch.device(f"cuda:{args.device_ids[local_rank]}" if torch.cuda.is_available() and args.cuda else "cpu")
     else:
@@ -166,7 +151,7 @@ if __name__ == "__main__":
         if device_count < args.world_size:
             device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
         else:
-            device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() and args.cuda else "cpu")
+            device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() and args.cuda else "cpu")'''
 
 
 
