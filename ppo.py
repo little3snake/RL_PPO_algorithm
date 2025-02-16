@@ -1,3 +1,5 @@
+from cmath import acosh
+
 import gymnasium as gym
 import time
 import numpy as np
@@ -11,6 +13,9 @@ import torch.distributed as dist
 
 class PPO:
     def __init__(self, policy_class, envs, device, rank=0, writer=None, **kwargs):
+        #print("PPO kwargs:", kwargs)
+        print ("Create PPO in rank ", rank)
+
         self.device = device
         self.world_size = kwargs.get("world_size", 1)
         self.rank = rank
@@ -25,7 +30,8 @@ class PPO:
         self.update_epochs = kwargs.get("update_epochs", 1)
         self.clip = kwargs.get("clip", 0.2)
         self.learning_rate = kwargs.get("learning_rate", 3e-4)
-        self.save_freq = kwargs.get("save_freq", 10)
+        self.save_freq = kwargs.get("save_freq", 1)
+        self.max_grad_norm = kwargs.get("max_grad_norm", 0.5)
 
         self.envs = envs
         self.n_observations = envs.single_observation_space.shape[0]
@@ -78,9 +84,14 @@ class PPO:
         for i in range(1, self.num_iterations + 1):
             #                          ROLLOUT (without values)
             #batch_lens = self.rollout(obs, done, i)  # ALG STEP 3
-            self.rollout(obs, done, i)  # ALG STEP 3
+            print(f"Rank {self.rank}: Starting iteration {i}")
+            self.rollout(obs, done, i) # ALG STEP 3
+            print(f"Rank {self.rank}: Rollout completed")
             #                                   COMPUTING A_K AND v
-            V, _ = self.evaluate()
+            V, _ = self.evaluate(self.observations, self.actions)
+            #print(f"discounted_rewards shape: {self.discounted_rewards.shape}")
+            #print(f"V shape: {V.shape}")
+
             A_k = (self.discounted_rewards - V.detach()).to(self.device)
             if A_k.numel() > 1:  # Проверка, что в A_k больше одного элемента
                 A_k = (A_k - A_k.mean()) / (A_k.std() + 1e-10)
@@ -89,22 +100,34 @@ class PPO:
             #A_k = (A_k - A_k.mean()) / (A_k.std() + 1e-10)
 
             if self.rank == 0:
-                self.update_model(A_k) # ALG STEP 6 & 7
+                print("ROOT 0 Check 1 Before update model.")
+                try:
+                    self.update_model(A_k)
+                    #self._log_summary()
+                    #print("ROOT 0 Check 2 After update model.")
+                except Exception as e:
+                    print(f"Error in rank 0: {e}")
+                    raise
+                #self.update_model(A_k) # ALG STEP 6 & 7
+                #self._log_summary()
 
-            if self.rank == 0:
-                self._log_summary()
-            #self._log_summary()
 
             if self.rank == 0 and i % self.save_freq == 0:
+                print("ROOT 0 Check 3 Before save model.")
                 torch.save(self.actor.state_dict(), './ppo_actor.pth')
                 torch.save(self.critic.state_dict(), './ppo_critic.pth')
+                print("ROOT 0 Check 4 After update model.")
 
             # TRY NOT TO MODIFY: record rewards for plotting purposes
             if self.rank == 0:
+                print("ROOT 0 Check 5 Before writer.")
                 self.writer.add_scalar("charts/learning_rate", self.actor_optim.param_groups[0]["lr"], self.global_step)
                 print("SPS:", int(self.global_step / (time.time() - start_time)))
                 self.writer.add_scalar("charts/SPS", int(self.global_step / (time.time() - start_time)), self.global_step)
+                print("ROOT 0 Check 6 After writer.")
 
+        #if self.world_size > 1:
+            #dist.barrier()  # Синхронизация перед завершением
         # creating a gif
         if self.rank == 0:
             frames, total_reward = self.create_gif()
@@ -117,26 +140,35 @@ class PPO:
     def rollout(self, obs, done, iteration):
         for step in range (0, self.num_steps):
             self.global_step += self.num_envs
-            print(obs[self.rank].shape) # shape [2,24]
-            print (self.observations[step].shape) # shape 1 [1,24]
-            #self.observations[step] = obs - initial code
-            self.observations[step] = obs[self.rank] # my code
+            #print ("local_num_envs ", self.local_num_envs)
+            #print(obs.shape) # shape [2,24]
+            #print (self.observations[step].shape) # shape 1 [1,24]
+            self.observations[step] = obs #- initial code
+            #self.observations[step] = obs[self.rank] # my code
             self.dones[step] = done
             with torch.no_grad():
                 action, log_prob = self.get_action(obs)
             obs, reward, terminated, truncated, infos = self.envs.step(action.cpu().numpy())
-            self.rewards[step] = torch.tensor(reward).to(self.device).view(-1) # to 1dim tensor
+            #print (f" local num envs: {self.local_num_envs}, num steps: {self.num_steps}")
+            #print (self.rewards)
+            #print (f"self.reward size: {self.rewards[step].shape} and {self.rewards[step]}")
+            #print(f"Step: {step}, Reward Shape: {torch.tensor(reward[self.rank]).shape}, Reward: {reward} and {reward[self.rank]}")
+
+            #self.rewards[step] = torch.tensor(reward[self.rank]).to(self.device).view(-1) # to 1dim tensor
+            self.rewards[step] = torch.tensor(reward).to(self.device).view(-1)  # to 1dim tensor
             self.actions[step] = action
             self.logprobs[step] = log_prob
             done = np.logical_or(terminated, truncated)
             obs = torch.tensor(obs).to(self.device)
             done = torch.tensor(done).to(self.device)
             if self.rank == 0 and "final_info" in infos:
+                print("ROOT 0 Check 7 Before final info.")
                 for info in infos["final_info"]:
                     if info and "episode" in info: # find information about episode (and info exist)
                         print(f"global_step={self.global_step}, episodic_return={info['episode']['r']}")
                         self.writer.add_scalar("charts/episodic_return", info["episode"]["r"], self.global_step)
                         self.writer.add_scalar("charts/episodic_length", info["episode"]["l"], self.global_step)
+                print("ROOT 0 Check 8 After final info.")
         print(
             f"local_rank: {self.rank}, action.sum(): {action.sum()}, iteration: {iteration}, "
             f"agent.actor.weight.sum(): {sum(p.sum() for p in self.actor.parameters() if p.requires_grad)}"
@@ -162,26 +194,54 @@ class PPO:
         return action.detach(), log_prob.detach()
 
     #for critic
-    def evaluate(self):
+    '''def evaluate(self):
         batch_observations = self.observations.view(-1, self.n_observations)
         batch_actions = self.actions.view(-1, self.n_actions)
         V = self.critic(batch_observations).squeeze()
         mean = self.actor(batch_observations)
+        print ("Shape of mean: ", mean.shape)
+        print("Shape of V: ", V.shape)
         distribution = MultivariateNormal(mean, self.cov_mat)
         log_probs = distribution.log_prob(batch_actions)
+        return V, log_probs'''
+    def evaluate(self, observations, actions):
+        V = self.critic(observations).squeeze()
+        mean = self.actor(observations)
+        #print("Shape of mean: ", mean.shape)
+        #print("Shape of V: ", V.shape)
+        distribution = MultivariateNormal(mean, self.cov_mat)
+        log_probs = distribution.log_prob(actions)
+        #print("Shape of log_prob (current): ", log_probs.shape)
         return V, log_probs
 
+    def reshape (self, A_k):
+        batch_A_k = A_k.reshape(-1)
+        #print (" In reshape() A_k shape: ", A_k.shape, " batch_A_k shape: ", batch_A_k.shape)
+        batch_observations = self.observations.reshape((-1,) + self.envs.single_observation_space.shape)
+        batch_actions = self.actions.reshape((-1,) + self.envs.single_action_space.shape)
+        batch_disc_rewards = self.discounted_rewards.reshape(-1)
+        batch_logprobs = self.logprobs.reshape(-1)
+        return batch_A_k, batch_observations, batch_actions, batch_disc_rewards, batch_logprobs
+
+
     def update_model(self, A_k):
+        '''batch_A_k, batch_observations, batch_actions, batch_disc_rewards, \
+        batch_logprobs = self.reshape(A_k)
+        #print ("Just after rashape() batch_A_k shape: ", batch_A_k.shape)
         for _ in range(self.update_epochs):
-            V, current_log_probs = self.evaluate()
-            ratios = torch.exp(current_log_probs - self.logprobs.view(-1))
+            batch_V, current_log_probs = self.evaluate(batch_observations, batch_actions)
+            ratios = torch.exp(current_log_probs - batch_logprobs)
+            #ratios = torch.exp(current_log_probs.view(-1) - self.logprobs.view(-1)) # if change every tensor
+            #print( "Ratios shape: ", ratios.shape, " batch_A_k shape: ", batch_A_k.shape)
             # clip_loss_1part = ratios * A_k
             # clip_loss_2part = torch.clamp(ratios, 1 - self.clip, 1 + self.clip) * A_k
-            clip_loss = torch.min(ratios * A_k, torch.clamp(ratios, 1 - self.clip, 1 + self.clip) * A_k)
+
+            clip_loss = torch.min(ratios * batch_A_k, torch.clamp(ratios, 1 - self.clip, 1 + self.clip) * batch_A_k)
             actor_loss = -clip_loss.mean()
             # actor_loss = (-torch.min(clip_loss_1part, clip_loss_2part)).mean()
             #critic_loss = nn.MSELoss()(V, self.discounted_rewards.view(-1))
-            critic_loss = nn.MSELoss()(V.view(-1), self.discounted_rewards.view(-1))
+            #critic_loss = nn.MSELoss()(V.view(-1), self.discounted_rewards.view(-1)) # if change every tensor
+            critic_loss = nn.MSELoss()(batch_V, batch_disc_rewards)
 
             self.actor_optim.zero_grad(set_to_none=True)
             actor_loss.backward()
@@ -189,22 +249,133 @@ class PPO:
             critic_loss.backward()
 
             if self.world_size > 1:
+                print("CHECK BEFORE ALL_REDUCE local_rank: ", self.rank)
+                dist.barrier()  # Синхронизация процессов перед выполнением операции
+                print("CHECK after dist.barrier ALL_REDUCE local_rank: ", self.rank)
                 actor_grads = torch.nn.utils.parameters_to_vector(
                     [p.grad for p in self.actor.parameters() if p.grad is not None])
+                print("CHECK after actor_grads ALL_REDUCE local_rank: ", self.rank)
                 dist.all_reduce(actor_grads, op=dist.ReduceOp.SUM)
+                print("CHECK after all_reduce for actor ALL_REDUCE local_rank: ", self.rank)
                 actor_grads /= self.world_size
+                print("CHECK after actor_grads / world size ALL_REDUCE local_rank: ", self.rank)
                 torch.nn.utils.vector_to_parameters(actor_grads,
                                                     [p.grad for p in self.actor.parameters() if p.grad is not None])
-
+                print("CHECK after torch.nn.utils ... ALL_REDUCE local_rank: ", self.rank)
                 critic_grads = torch.nn.utils.parameters_to_vector(
                     [p.grad for p in self.critic.parameters() if p.grad is not None])
                 dist.all_reduce(critic_grads, op=dist.ReduceOp.SUM)
                 critic_grads /= self.world_size
                 torch.nn.utils.vector_to_parameters(critic_grads, [p.grad for p in self.critic.parameters() if
                                                                    p.grad is not None])
+                print("CHECK AFTER ALL_REDUCE local_rank: ", self.rank)
 
             self.actor_optim.step()
-            self.critic_optim.step()
+            self.critic_optim.step()'''
+
+        try:
+            batch_A_k, batch_observations, batch_actions, batch_disc_rewards, \
+                batch_logprobs = self.reshape(A_k)
+            print(f"Rank {self.rank}: After reshape")
+
+            for _ in range(self.update_epochs):
+                batch_V, current_log_probs = self.evaluate(batch_observations, batch_actions)
+                print(f"Rank {self.rank}: After evaluate")
+
+                ratios = torch.exp(current_log_probs - batch_logprobs)
+                print(f"Rank {self.rank}: After ratios calculation")
+
+                clip_loss = torch.min(ratios * batch_A_k,
+                                          torch.clamp(ratios, 1 - self.clip, 1 + self.clip) * batch_A_k)
+                actor_loss = -clip_loss.mean()
+                critic_loss = nn.MSELoss()(batch_V, batch_disc_rewards)
+
+                self.actor_optim.zero_grad(set_to_none=True)
+                actor_loss.backward()
+                self.critic_optim.zero_grad(set_to_none=True)
+                critic_loss.backward()
+                print(f"Rank {self.rank}: After computing losses")
+
+                if self.world_size > 1:
+                    '''actor_grads = torch.nn.utils.parameters_to_vector(
+                        [p.grad for p in self.actor.parameters() if p.grad is not None])
+                    print(f"Rank {self.rank}: After actor_grads calculation")
+
+                    dist.all_reduce(actor_grads, op=dist.ReduceOp.SUM)
+                    print(f"Rank {self.rank}: After dist.all_reduce for actor_grads")
+
+                    actor_grads /= self.world_size
+                    torch.nn.utils.vector_to_parameters(actor_grads,
+                                                            [p.grad for p in self.actor.parameters() if
+                                                             p.grad is not None])
+
+                    critic_grads = torch.nn.utils.parameters_to_vector(
+                        [p.grad for p in self.critic.parameters() if p.grad is not None])
+                    dist.all_reduce(critic_grads, op=dist.ReduceOp.SUM)
+                    critic_grads /= self.world_size
+                    torch.nn.utils.vector_to_parameters(critic_grads, [p.grad for p in self.critic.parameters() if
+                                                                           p.grad is not None])
+                    #print(f"Rank {self.rank}: Before dist.barrier")
+                    #dist.barrier()  # Синхронизация процессов перед выполнением операции
+                    #print(f"Rank {self.rank}: After dist.barrier")'''
+                    # Синхронизация градиентов для actor
+                    print ("Before barrier")
+                    #dist.barrier()
+                    print(f"Rank {self.rank}: Start reduce in actor")
+                    all_actor_grads_list = []
+                    print(f"Rank {self.rank}: Reduce1 in actor")
+                    for param in self.actor.parameters():
+                        if param.grad is not None:
+                            all_actor_grads_list.append(param.grad.view(-1))
+                    print(f"Rank {self.rank}: Reduce2 in actor")
+                    all_actor_grads = torch.cat(all_actor_grads_list)
+                    print(f"Rank {self.rank}: all_actor_grads device: {all_actor_grads.device}")
+                    # Если устройство не совпадает, переносим на CPU
+                    if all_actor_grads.device != torch.device("cpu"): # because of dist and gloo
+                        all_actor_grads = all_actor_grads.cpu()
+                    print(f"Rank {self.rank}: Reduce3 in actor")
+                    dist.all_reduce(all_actor_grads, op=dist.ReduceOp.SUM)
+                    print(f"Rank {self.rank}: After summing, before dist in actor")
+                    # Распределение синхронизированных градиентов обратно по параметрам actor
+                    offset = 0
+                    for param in self.actor.parameters():
+                        if param.grad is not None:
+                            param.grad.data.copy_(
+                                all_actor_grads[offset: offset + param.numel()].view_as(
+                                    param.grad.data) / self.world_size
+                            )
+                            offset += param.numel()
+                    print(f"Rank {self.rank}: After dist actor")
+                    # Синхронизация градиентов для critic
+                    all_critic_grads_list = []
+                    for param in self.critic.parameters():
+                        if param.grad is not None:
+                            all_critic_grads_list.append(param.grad.view(-1))
+                    all_critic_grads = torch.cat(all_critic_grads_list)
+                    dist.all_reduce(all_critic_grads, op=dist.ReduceOp.SUM)
+                    # Распределение синхронизированных градиентов обратно по параметрам critic
+                    offset = 0
+                    for param in self.critic.parameters():
+                        if param.grad is not None:
+                            param.grad.data.copy_(
+                                all_critic_grads[offset: offset + param.numel()].view_as(
+                                    param.grad.data) / self.world_size
+                            )
+                            offset += param.numel()
+                    print(f"Rank {self.rank}: After dist in critic")
+
+                    # Обрезка градиентов для actor и critic
+                    nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
+                    nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
+
+
+                self.actor_optim.step()
+                self.critic_optim.step()
+                print(f"Rank {self.rank}: After optimizer step")
+
+        except Exception as e:
+            print(f"Error in rank {self.rank}: {e}")
+            raise
 
     def create_gif (self):
         obs, _ = self.envs.reset()
