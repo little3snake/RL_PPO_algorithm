@@ -20,30 +20,30 @@ from network import NN
 @dataclass
 class Args:
     #def __init__(self):
-    exp_name = os.path.basename(__file__)[: -len(".py")]
-    seed = 1
-    torch_deterministic = True # fixed order - in input1 = input2 -> output1 = output2
-    cuda = True
-    track = False # tracking metrics (in wandb)
-    wandb_project_name = "PPO_PyTorch_distributed"
-    wandb_entity = None # the name of the user/group
+    exp_name: str = os.path.basename(__file__)[: -len(".py")]
+    seed: int = 1
+    torch_deterministic: bool = True # fixed order - in input1 = input2 -> output1 = output2
+    cuda: bool = True
+    track: bool = False # tracking metrics (in wandb)
+    wandb_project_name: str = "PPO_PyTorch_distributed"
+    wandb_entity: str = None # the name of the user/group
     #capture_gif = False
-    capture_video = False
-    env_name = "BipedalWalker-v3"
-    total_timesteps = 100_000
-    learning_rate = 0.0004755
-    gamma = 0.99421
-    clip = 0.286
-    local_num_envs = 2
-    num_steps = 4096// local_num_envs # before updating - timesteps_per_batch / local_num_envs
-    num_minibatches = 4 # the number of minibatches for one updating
-    update_epochs = 18 # 4 - oridinally -- n_updates_per_iteration
-    max_timesteps_per_episode = 1600
+    capture_video: bool = False
+    env_name: str = "BipedalWalker-v3"
+    total_timesteps: int = 100_000
+    learning_rate: float = 0.0004755
+    gamma: float = 0.99421
+    clip: float = 0.286
+    local_num_envs: int = 2
+    num_steps: int = 4096// local_num_envs # before updating - timesteps_per_batch / local_num_envs
+    num_minibatches: int = 4 # the number of minibatches for one updating
+    update_epochs: int = 18 # 4 - oridinally -- n_updates_per_iteration
+    max_timesteps_per_episode: int = 1600
     max_grad_norm: float = 0.5
     device_ids: List[int] = field(default_factory=lambda: [])
-    backend = "gloo"  # "nccl" # gloo
+    backend: str = "gloo"  # "nccl" # gloo
     #init in runtime
-    world_size = 1
+    world_size: int = 1
     #local_batch_size: int = 0
     #local_minibatch_size: int = 0
     num_envs: int = 0
@@ -71,11 +71,11 @@ class Args:
 def make_env(env_name, id, capture_video, run_name):
     def thunk ():
         #if capture_video and id == 0:
-        if id == 0:
-            env = gym.make(env_name, render_mode="rgb_array")
+        #if id == 0:
+        env = gym.make(env_name, render_mode="rgb_array")
             #env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
-        else:
-            env = gym.make(env_name)
+        #else:
+            #env = gym.make(env_name)
         #env = gym.wrappers.GrayScaleObservation(env)
         return env
     return thunk
@@ -163,10 +163,19 @@ if __name__ == "__main__":
         device = torch.device(f"cuda:{args.device_ids[local_rank]}" if torch.cuda.is_available() and args.cuda else "cpu")
     else:
         device_count = torch.cuda.device_count()
-        if device_count < args.world_size:
+        print("device count: ", device_count)
+        '''if device_count < args.world_size:
             device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
+            print (f"device first step. device for {local_rank} is {device}")
         else:
-            device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() and args.cuda else "cpu")
+            device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() and args.cuda else "cpu")'''
+        #if device_count < args.world_size or local_rank != 0:  # Используем GPU только для процесса с local_rank=0
+        if local_rank != 0:
+            device = torch.device("cpu")
+            print(f"device for {local_rank} is {device}")
+        else:
+            device = torch.device("cpu") # cuda:0
+            print(f"device for {local_rank} is {device}")
 
 
 
@@ -176,13 +185,33 @@ if __name__ == "__main__":
     )
     #env = gym.make(args.env_id)
     #assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
+    #print ("local_num_envs", args.local_num_envs)
+    #print(f"Rank {local_rank}: args before PPO init: {vars(args)}")
+
+    # Логирование памяти GPU после инициализации устройства
+    if device.type == "cuda":
+        print(
+            f"Rank {local_rank}: GPU memory allocated after device init: {torch.cuda.memory_allocated() / 1e6:.2f} MB")
+        print(f"Rank {local_rank}: GPU memory reserved after device init: {torch.cuda.memory_reserved() / 1e6:.2f} MB")
 
     model = PPO(policy_class=NN, envs=envs, device=device, rank=local_rank, writer=writer, **vars(args))
 
+    # Логирование памяти GPU после инициализации модели
+    if device.type == "cuda":
+        print(f"Rank {local_rank}: GPU memory allocated after model init: {torch.cuda.memory_allocated() / 1e6:.2f} MB")
+        print(f"Rank {local_rank}: GPU memory reserved after model init: {torch.cuda.memory_reserved() / 1e6:.2f} MB")
+
     #model.learn(total_timesteps=args.total_timesteps, writer=writer)
-    frames, total_reward = model.learn()
-    save_frames_as_gif(frames)
-    print('total reward trained model =', total_reward)
+    #frames, total_reward = model.learn()
+
+    # Логирование памяти GPU после обучения
+    if device.type == "cuda":
+        print(f"Rank {local_rank}: GPU memory allocated after training: {torch.cuda.memory_allocated() / 1e6:.2f} MB")
+        print(f"Rank {local_rank}: GPU memory reserved after training: {torch.cuda.memory_reserved() / 1e6:.2f} MB")
+
+    '''if local_rank == 0:
+        save_frames_as_gif(frames)
+        print('total reward trained model =', total_reward)
 
     envs.close()
     if local_rank == 0:
@@ -191,4 +220,20 @@ if __name__ == "__main__":
             wandb.finish()
 
     if args.world_size > 1:
-        dist.destroy_process_group()
+        dist.destroy_process_group()'''
+    try:
+        frames, total_reward = model.learn()
+    except Exception as e:
+        print(f"Error in rank {local_rank}: {e}")
+        frames, total_reward = [], 0
+    finally:
+        if local_rank == 0:
+            save_frames_as_gif(frames)
+            print('total reward trained model =', total_reward)
+        envs.close()
+        if local_rank == 0:
+            writer.close()
+            if args.track:
+                wandb.finish()
+        if args.world_size > 1:
+            dist.destroy_process_group()
