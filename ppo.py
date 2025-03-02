@@ -72,8 +72,9 @@ class PPO:
                 self.critic_optim.param_groups[0]["lr"] = lrnow
 
             rollout_start = time.time()
-            batch_observations, batch_actions, batch_log_probs, batch_next_observations, batch_dones, batch_rewards, batch_discounted_rewards, batch_lens = \
-                self.rollout(timesteps_current)  # ALG STEP 3
+            #batch_observations, batch_actions, batch_log_probs, batch_next_observations, batch_dones, batch_rewards, batch_discounted_rewards, batch_lens = \
+            #    self.rollout(timesteps_current)  # ALG STEP 3
+            batch_observations, batch_actions, batch_log_probs, batch_discounted_rewards, batch_lens = self.rollout(timesteps_current)
             rollout_end = time.time()
             self.logger['rollout_time'] = rollout_end - rollout_start
 
@@ -94,7 +95,13 @@ class PPO:
             self.logger['counting_time'] = counting_end - counting_start
 
             weights_update_start = time.time()
+            #batch_inds = np.arange(self.timesteps_per_batch)
             for _ in range(self.n_updates_per_iteration):  # ALG STEP 6 & 7
+                #np.random.shuffle(batch_inds)
+                #for i in range(0, self.timesteps_per_batch, self.minibatch_size):
+                #    start = i
+                #    finish = i + self.minibatch_size
+                #    minibatch_inds = batch_inds[start:finish]
                 V, current_log_probs, entropy = self.evaluate(batch_observations, batch_actions)
                 ratios = torch.exp(current_log_probs - batch_log_probs)
                 #clip_loss_1part = ratios * A_k
@@ -102,7 +109,7 @@ class PPO:
                 #print (ratios.shape)
                 clip_loss = torch.min(ratios * A_k, torch.clamp(ratios, 1 - self.clip, 1 + self.clip) * A_k)
                 actor_loss = -clip_loss.mean()
-                actor_loss -= entropy.mean()
+                actor_loss -= entropy.mean() * self.entropy_coef
                 #actor_loss = (-torch.min(clip_loss_1part, clip_loss_2part)).mean()
                 critic_loss = nn.MSELoss()(V, batch_discounted_rewards)
 
@@ -154,15 +161,15 @@ class PPO:
         episode_rewards, last_episode_rewards = [], [] # last only for writer
         batch_len = 0
 
-        for current_timestep in range(self.timesteps_per_batch):
-        #while current_timestep < self.timesteps_per_batch:
-            #episode_rewards = []
-            #observation, _ = self.env.reset()  # Reset the environment
-            #observation = torch.tensor(observation, dtype=torch.float, device=self.device)
-            #done = False
+        #for current_timestep in range(self.timesteps_per_batch):
+        while current_timestep < self.timesteps_per_batch:
+            episode_rewards = []
+            observation, _ = self.env.reset()  # Reset the environment
+            observation = torch.tensor(observation, dtype=torch.float, device=self.device)
+            done = False
             timestep_start = current_timestep
 
-            #for _ in range(self.max_timesteps_per_episode):
+            '''#for _ in range(self.max_timesteps_per_episode):
                 #current_timestep += 1
                 #batch_observations.append(observation)
             with torch.no_grad():
@@ -207,19 +214,44 @@ class PPO:
         batch_log_probs = torch.stack(batch_log_probs).to(self.device)
         batch_dones = torch.stack(batch_dones).to(self.device)
         batch_rewards = torch.stack(batch_rewards).to(self.device)
-        batch_discounted_rewards = self.compute_discounted_rewards(batch_rews).to(self.device)
+        batch_discounted_rewards = self.compute_discounted_rewards(batch_rews).to(self.device)'''
+            for _ in range(self.max_timesteps_per_episode):
+                current_timestep += 1
+                #print ("current_timestep", current_timestep)
+                batch_observations.append(observation)
+                with torch.no_grad():
+                    action, log_prob = self.get_action(observation)
+                # action = action.clone().detach().to(dtype=torch.float, device=self.device)
+                # log_prob = log_prob.clone().detach().to(dtype=torch.float, device=self.device)
 
-        self.logger['batch_rewards'] = batch_rews
+                # action, log_prob = self.get_action(torch.tensor(observation, dtype=torch.float).to(self.device))
+                observation, reward, terminated, truncated, _ = self.env.step(action.cpu().numpy())
+                observation = torch.tensor(observation, dtype=torch.float, device=self.device)
+                episode_rewards.append(reward)
+                batch_actions.append(action)
+                batch_log_probs.append(log_prob)
+                if terminated or truncated:
+                    break
+            #print ("end")
+
+            batch_lens.append(len(episode_rewards))
+            batch_rewards.append(episode_rewards)
+
+        batch_observations = torch.stack(batch_observations).to(self.device)
+        batch_actions = torch.stack(batch_actions).to(self.device)
+        batch_log_probs = torch.stack(batch_log_probs).to(self.device)
+        batch_discounted_rewards = self.compute_discounted_rewards(batch_rewards).to(self.device)
+
+        self.logger['batch_rewards'] = batch_rewards
         self.logger['batch_lens'] = batch_lens
-
         timestep_current += np.sum(batch_lens)
-
         avg_episode_rewards = np.mean([np.sum(episode_rewards) for episode_rewards in self.logger['batch_rewards']])
         avg_episode_lens = np.mean(self.logger['batch_lens'])
         self.writer.add_scalar("charts/avg_episode_rewards", avg_episode_rewards, timestep_current)
         self.writer.add_scalar("charts/avg_episode_lens", avg_episode_lens, timestep_current)
 
-        return batch_observations, batch_actions, batch_log_probs, batch_next_observations, batch_dones, batch_rewards, batch_discounted_rewards, batch_lens
+        #return batch_observations, batch_actions, batch_log_probs, batch_next_observations, batch_dones, batch_rewards, batch_discounted_rewards, batch_lens
+        return batch_observations, batch_actions, batch_log_probs, batch_discounted_rewards, batch_lens
 
     def compute_discounted_rewards(self, batch_rewards):
         batch_discounted_rewards = []
