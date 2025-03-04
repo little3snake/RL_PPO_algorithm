@@ -28,6 +28,9 @@ class PPO:
         self.learning_rate = kwargs.get("learning_rate", 3e-4)
         self.save_freq = kwargs.get("save_freq", 1)
         self.max_grad_norm = kwargs.get("max_grad_norm", 0.5)
+        self.entropy_coef = kwargs.get("entropy_coef", 0.01)
+        self.local_batch_size = kwargs.get("local_batch_size", 1)
+        self.local_minibatch_size = kwargs.get("local_minibatch_size", 1)
 
         self.envs = envs
         self.n_observations = envs.single_observation_space.shape[0]
@@ -51,14 +54,14 @@ class PPO:
                 dist.broadcast(param.data, src=0)
         # For root
         if self.rank == 0:
-            self.logger = {
+            '''self.logger = {
                 'delta_t': time.time_ns(),
                 'timesteps_current': 0,
                 'iterations_current': 0,
                 'batch_lens': [],
                 'batch_rewards': [],    # episodic returns
                 'actor_losses': [],     # losses of actor network in current iteration
-            }
+            }'''
 
     def zeros_init(self):
         self.observations = torch.zeros((self.num_steps, self.local_num_envs) + self.envs.single_observation_space.shape).to(self.device)
@@ -77,12 +80,10 @@ class PPO:
         done = torch.zeros(self.local_num_envs).to(self.device)
 
         for i in range(1, self.num_iterations + 1):
-            #                          ROLLOUT (without values)
             self.rollout(obs, done, i) # ALG STEP 3
-            #                                   COMPUTING A_K AND v
-            V, _ = self.evaluate(self.observations, self.actions)
+            V = self.critic(self.observations).squeeze()
             A_k = (self.discounted_rewards - V.detach()).to(self.device)
-            if A_k.numel() > 1:  # Проверка, что в A_k больше одного элемента
+            if A_k.numel() > 1:
                 A_k = (A_k - A_k.mean()) / (A_k.std() + 1e-10)
             else:
                 A_k = torch.zeros_like(A_k)  # Если данных недостаточно, обнуляем A_k
@@ -96,16 +97,24 @@ class PPO:
                 torch.save(self.critic.state_dict(), './ppo_critic.pth')
 
             if self.rank == 0:
-                self.writer.add_scalar("charts/learning_rate", self.actor_optim.param_groups[0]["lr"], self.global_step)
-                print("SPS:", int(self.global_step / (time.time() - start_time)))
-                self.writer.add_scalar("charts/SPS", int(self.global_step / (time.time() - start_time)), self.global_step)
+                # self.writer.add_scalar("charts/learning_rate", self.actor_optim.param_groups[0]["lr"], self.global_step)
+                # print("SPS:", int(self.global_step / (time.time() - start_time)))
+                # self.writer.add_scalar("charts/SPS", int(self.global_step / (time.time() - start_time)), self.global_step)
+                self.writer.add_scalar("charts/actor_learning_rate", self.actor_optim.param_groups[0]["lr"],
+                                       self.global_step)
+                self.writer.add_scalar("charts/current_step", int(time.time() - start_time), self.global_step)
+                self.writer.add_scalar("charts/current_iteration", int(time.time() - start_time), i)
+                #self.writer.add_scalar("losses/actor_loss", actor_loss.item(), self.global_step)
+                #self.writer.add_scalar("losses/critic_loss", critic_loss.item(), self.global_step)
+                reward, episode_len = self.try_for_reward_in_wandb()
+                self.writer.add_scalar("charts/reward", reward, self.global_step)
+                self.writer.add_scalar("charts/episode_len", episode_len, self.global_step)
+                self.writer.add_scalar("charts/current_step", int(time.time() - start_time), self.global_step)
 
         # creating a gif
         if self.rank == 0:
             frames, total_reward = self.create_gif()
             print ("before return in learn")
-            #print(type(frames))  # Проверяем тип данных
-            #print(frames)  # Проверяем содержимое
             return list(frames), total_reward
         return [], 0
 
@@ -124,19 +133,11 @@ class PPO:
             done = np.logical_or(terminated, truncated)
             obs = torch.tensor(obs).to(self.device)
             done = torch.tensor(done).to(self.device)
-            if self.rank == 0 and "final_info" in infos:
-                print("ROOT 0 Check 7 Before final info.")
-                for info in infos["final_info"]:
-                    if info and "episode" in info: # find information about episode (and info exist)
-                        print(f"global_step={self.global_step}, episodic_return={info['episode']['r']}")
-                        self.writer.add_scalar("charts/episodic_return", info["episode"]["r"], self.global_step)
-                        self.writer.add_scalar("charts/episodic_length", info["episode"]["l"], self.global_step)
-                print("ROOT 0 Check 8 After final info.")
         print(
             f"local_rank: {self.rank}, action.sum(): {action.sum()}, iteration: {iteration}, "
             f"agent.actor.weight.sum(): {sum(p.sum() for p in self.actor.parameters() if p.requires_grad)}"
+            #f"reward: {total_reward}"
         )
-        #  COMPUTE DISCOUNTED REWARD
         self.compute_discounted_rewards()
 
     def compute_discounted_rewards(self):
@@ -159,7 +160,8 @@ class PPO:
         mean = self.actor(observations)
         distribution = MultivariateNormal(mean, self.cov_mat)
         log_probs = distribution.log_prob(actions)
-        return V, log_probs
+        entropy = distribution.entropy()
+        return V, log_probs, entropy
 
     def reshape (self, A_k):
         batch_A_k = A_k.reshape(-1)
@@ -174,63 +176,85 @@ class PPO:
         try:
             batch_A_k, batch_observations, batch_actions, batch_disc_rewards, \
                 batch_logprobs = self.reshape(A_k)
+            batch_inds = np.arange(self.local_batch_size)
             for _ in range(self.update_epochs):
-                batch_V, current_log_probs = self.evaluate(batch_observations, batch_actions)
-                ratios = torch.exp(current_log_probs - batch_logprobs)
-                clip_loss = torch.min(ratios * batch_A_k,
-                                          torch.clamp(ratios, 1 - self.clip, 1 + self.clip) * batch_A_k)
-                actor_loss = -clip_loss.mean()
-                critic_loss = nn.MSELoss()(batch_V, batch_disc_rewards)
-                self.actor_optim.zero_grad(set_to_none=True)
-                actor_loss.backward()
-                self.critic_optim.zero_grad(set_to_none=True)
-                critic_loss.backward()
+                np.random.shuffle(batch_inds)
+                for i in range(0, self.local_batch_size, self.local_minibatch_size):
+                    start = i
+                    finish = i + self.local_minibatch_size
+                    minibatch_inds = batch_inds[start:finish]
 
-                if self.world_size > 1:
-                    all_actor_grads_list = []
-                    for param in self.actor.parameters():
-                        if param.grad is not None:
-                            all_actor_grads_list.append(param.grad.view(-1))
-                    all_actor_grads = torch.cat(all_actor_grads_list)
-                    if all_actor_grads.device != torch.device("cpu"): # because of dist and gloo
-                        all_actor_grads = all_actor_grads.cpu()
-                    #dist.barrier()
-                    dist.all_reduce(all_actor_grads, op=dist.ReduceOp.SUM)
+                    batch_V, current_log_probs, entropy = self.evaluate(batch_observations[minibatch_inds], batch_actions[minibatch_inds])
+                    ratios = torch.exp(current_log_probs - batch_logprobs[minibatch_inds])
+                    clip_loss = torch.min(ratios * batch_A_k[minibatch_inds], torch.clamp(ratios, 1 - self.clip, 1 + self.clip) * batch_A_k[minibatch_inds])
+                    actor_loss = -clip_loss.mean()
+                    actor_loss -= entropy.mean() * self.entropy_coef
+                    critic_loss = nn.MSELoss()(batch_V, batch_disc_rewards[minibatch_inds])
+                    self.actor_optim.zero_grad(set_to_none=True)
+                    actor_loss.backward()
+                    self.critic_optim.zero_grad(set_to_none=True)
+                    critic_loss.backward()
 
-                    offset = 0
-                    for param in self.actor.parameters():
-                        if param.grad is not None:
-                            param.grad.data.copy_(
-                                all_actor_grads[offset: offset + param.numel()].view_as(
-                                    param.grad.data) / self.world_size
-                            )
-                            offset += param.numel()
+                    if self.world_size > 1:
+                        all_actor_grads_list = []
+                        for param in self.actor.parameters():
+                            if param.grad is not None:
+                                all_actor_grads_list.append(param.grad.view(-1))
+                        all_actor_grads = torch.cat(all_actor_grads_list)
+                        if all_actor_grads.device != torch.device("cpu"): # because of dist and gloo
+                            all_actor_grads = all_actor_grads.cpu()
+                        dist.all_reduce(all_actor_grads, op=dist.ReduceOp.SUM)
 
-                    all_critic_grads_list = []
-                    for param in self.critic.parameters():
-                        if param.grad is not None:
-                            all_critic_grads_list.append(param.grad.view(-1))
-                    all_critic_grads = torch.cat(all_critic_grads_list)
-                    dist.all_reduce(all_critic_grads, op=dist.ReduceOp.SUM)
+                        offset = 0
+                        for param in self.actor.parameters():
+                            if param.grad is not None:
+                                param.grad.data.copy_(
+                                    all_actor_grads[offset: offset + param.numel()].view_as(
+                                        param.grad.data) / self.world_size
+                                )
+                                offset += param.numel()
 
-                    offset = 0
-                    for param in self.critic.parameters():
-                        if param.grad is not None:
-                            param.grad.data.copy_(
-                                all_critic_grads[offset: offset + param.numel()].view_as(
-                                    param.grad.data) / self.world_size
-                            )
-                            offset += param.numel()
+                        all_critic_grads_list = []
+                        for param in self.critic.parameters():
+                            if param.grad is not None:
+                                all_critic_grads_list.append(param.grad.view(-1))
+                        all_critic_grads = torch.cat(all_critic_grads_list)
+                        dist.all_reduce(all_critic_grads, op=dist.ReduceOp.SUM)
 
-                    # Обрезка градиентов для actor и critic
+                        offset = 0
+                        for param in self.critic.parameters():
+                            if param.grad is not None:
+                                param.grad.data.copy_(
+                                    all_critic_grads[offset: offset + param.numel()].view_as(
+                                        param.grad.data) / self.world_size
+                                )
+                                offset += param.numel()
+
+                    # cut gradients
                     nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
                     nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
 
-                self.actor_optim.step()
-                self.critic_optim.step()
+                    self.actor_optim.step()
+                    self.critic_optim.step()
+
+                #return actor_loss, critic_loss
         except Exception as e:
             print(f"Error in rank {self.rank}: {e}")
             raise
+
+    def try_for_reward_in_wandb(self):
+        episode_len = 0
+        obs, _ = self.envs.reset()
+        total_reward = 0
+        done = False
+        while not done:
+            episode_len += 1
+            obs = torch.tensor(obs, dtype=torch.float).to(self.device)
+            action, _ = self.get_action(obs)
+            obs, reward, terminated, truncated, _ = self.envs.step(action.cpu().numpy())
+            total_reward += reward
+            done = np.logical_or(terminated[0], truncated[0])
+        return np.mean(total_reward), episode_len
 
     def create_gif (self):
         obs, _ = self.envs.reset()
@@ -247,7 +271,7 @@ class PPO:
             done = np.logical_or(terminated[0], truncated[0])
         return frames, total_reward
 
-    def _log_summary(self):
+    '''def _log_summary(self):
         delta_t = self.logger['delta_t']
         self.logger['delta_t'] = time.time_ns()
         delta_t = (self.logger['delta_t'] - delta_t) / 1e9
@@ -281,4 +305,4 @@ class PPO:
 
         self.logger['batch_lens'] = []
         self.logger['batch_rewards'] = []
-        self.logger['actor_losses'] = []
+        self.logger['actor_losses'] = []'''
