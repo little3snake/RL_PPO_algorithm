@@ -15,10 +15,6 @@ class NN(nn.Module):
     x = F.relu(self.layer2(x))
     return self.layer3(x)
 
-  #def sync_parameters(self):
-  #  for param in self.parameters():
-  #    dist.broadcast(param.data, src=0)
-
 
 
 
