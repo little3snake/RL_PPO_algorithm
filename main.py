@@ -30,8 +30,8 @@ class Args:
         #capture_gif = False
         self.capture_video = False
         self.env_name = "BipedalWalker-v3"
-        self.total_timesteps = 3_500_000
-        self.learning_rate = 0.0004755#87104
+        self.total_timesteps = 1_500_000
+        self.learning_rate = 0.0004755#0.0004755#87104 # * world_size
         self.anneal_lr = False
         self.gamma = 0.99421#0.988
         self.clip = 0.286#0.2566
@@ -77,7 +77,7 @@ def make_env(env_name, id, capture_video, run_name):
         if id == 0:
             env = gym.make(env_name, render_mode="rgb_array")
         else:
-            env = gym.make(env_name)
+            env = gym.make(env_name, render_mode="rgb_array")
         return env
     return thunk
 
@@ -107,7 +107,7 @@ if __name__ == "__main__":
             wandb.init(
                 project=args.wandb_project_name,
                 entity=args.wandb_entity,
-                sync_tensorboard=True,
+                sync_tensorboard=False,#True
                 config=vars(args),
                 name=run_name,
                 monitor_gym=True,
@@ -115,6 +115,21 @@ if __name__ == "__main__":
                 save_code=True,
                 settings=wandb.Settings(code_dir="."),  # add all files in dir
             )
+            # Определяем, какие метрики будут использоваться как step для других метрик
+            wandb.define_metric("global_step")
+            wandb.define_metric("iteration")
+            wandb.define_metric("global_step_world_size")
+
+            # Указываем, какие метрики используют какие step
+            wandb.define_metric("charts/reward", step_metric="global_step")
+            wandb.define_metric("charts/allreducetime_persentage_in_batchtime", step_metric="global_step")
+            wandb.define_metric("charts/allreducetime_persentage_in_itertime", step_metric="global_step")
+            wandb.define_metric("charts/episode_len", step_metric="global_step")
+            wandb.define_metric("charts/current_step", step_metric="global_step")
+            wandb.define_metric("charts/actor_learning_rate", step_metric="global_step")
+            wandb.define_metric("charts/reward_new", step_metric="iteration")
+            wandb.define_metric("charts/reward_new_new", step_metric="global_step_world_size")
+
         writer = SummaryWriter(f"runs/{args.exp_name}")
         writer.add_text(
             "hyperparameters",
@@ -127,7 +142,8 @@ if __name__ == "__main__":
         #device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
         device = "cpu"
     else:
-        device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() and args.cuda else "cpu")
+        #device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() and args.cuda else "cpu")
+        device = "cpu"
 
     # Set unique seed per process
     args.seed += local_rank
