@@ -3,6 +3,7 @@ import gymnasium as gym
 import time
 import numpy as np
 import torch
+import wandb
 import torch.nn as nn
 from torch import dtype
 from torch.optim import Adam
@@ -14,9 +15,11 @@ class PPO:
     def __init__(self, policy_class, envs, device, rank=0, writer=None, **kwargs):
         self.device = device
         self.world_size = kwargs.get("world_size", 1)
+        print("world size", self.world_size)
         self.rank = rank
         self.writer = writer
         self.seed = kwargs.get("seed", 1)
+        self.track = kwargs.get("track", False)
 
         self.num_steps = kwargs.get("num_steps", 1) # rollout steps for 1 process per batch
         self.gamma = kwargs.get("gamma", 0.99421)
@@ -71,6 +74,7 @@ class PPO:
         self.dones = torch.zeros((self.num_steps, self.local_num_envs)).to(self.device)
         self.discounted_rewards = torch.zeros_like(self.rewards).to(self.device)
         self.global_step = 0
+        self.global_step_for_writer = 0
 
     def learn(self):
         self.global_step = 0
@@ -78,8 +82,10 @@ class PPO:
         obs, _ = self.envs.reset(seed=self.seed)
         obs = torch.Tensor(obs).to(self.device)
         done = torch.zeros(self.local_num_envs).to(self.device)
+        itertime = 0
 
         for i in range(1, self.num_iterations + 1):
+            itertimestart = time.time()
             self.rollout(obs, done, i) # ALG STEP 3
             V = self.critic(self.observations).squeeze()
             A_k = (self.discounted_rewards - V.detach()).to(self.device)
@@ -88,7 +94,9 @@ class PPO:
             else:
                 A_k = torch.zeros_like(A_k)  # Если данных недостаточно, обнуляем A_k
 
-            self.update_model(A_k) # ALG STEP 6 & 7
+            allreducetime, batchtime = self.update_model(A_k) # ALG STEP 6 & 7
+            itertimeend = time.time()
+            itertime = itertimeend - itertimestart
             #if self.rank == 0:
                 # self._log_summary()
 
@@ -96,24 +104,28 @@ class PPO:
                 torch.save(self.actor.state_dict(), './ppo_actor.pth')
                 torch.save(self.critic.state_dict(), './ppo_critic.pth')
 
-            if self.rank == 0:
-                # self.writer.add_scalar("charts/learning_rate", self.actor_optim.param_groups[0]["lr"], self.global_step)
-                # print("SPS:", int(self.global_step / (time.time() - start_time)))
-                # self.writer.add_scalar("charts/SPS", int(self.global_step / (time.time() - start_time)), self.global_step)
-                self.writer.add_scalar("charts/actor_learning_rate", self.actor_optim.param_groups[0]["lr"],
-                                       self.global_step)
-                self.writer.add_scalar("charts/current_step", int(time.time() - start_time), self.global_step)
-                self.writer.add_scalar("charts/current_iteration", int(time.time() - start_time), i)
-                #self.writer.add_scalar("losses/actor_loss", actor_loss.item(), self.global_step)
-                #self.writer.add_scalar("losses/critic_loss", critic_loss.item(), self.global_step)
+            if self.rank == 0 and self.track:
                 reward, episode_len = self.try_for_reward_in_wandb()
-                self.writer.add_scalar("charts/reward", reward, self.global_step)
-                self.writer.add_scalar("charts/episode_len", episode_len, self.global_step)
-                self.writer.add_scalar("charts/current_step", int(time.time() - start_time), self.global_step)
+                wandb.log({
+                    "global_step": self.global_step,
+                    "iteration": i,
+                    "charts/allreducetime_persentage_in_batchtime": allreducetime/batchtime,
+                    "charts/allreducetime_persentage_in_itertime": allreducetime/itertime,
+                    "global_step_world_size": self.global_step * self.world_size,
+                    "charts/reward": reward,
+                    "charts/episode_len": episode_len,
+                    "charts/current_step": int(time.time() - start_time),
+                    "charts/actor_learning_rate": self.actor_optim.param_groups[0]["lr"],
+                    #"charts/reward_new": reward,
+                    #"charts/reward_new_new": reward,
+                })
+                print ("g_s ", self.global_step, " i ", i, " g_s*w_s ", self.global_step * self.world_size)
 
         # creating a gif
         if self.rank == 0:
             frames, total_reward = self.create_gif()
+            #frames = []
+            #total_reward = 0
             print ("before return in learn")
             return list(frames), total_reward
         return [], 0
@@ -121,7 +133,9 @@ class PPO:
 
     def rollout(self, obs, done, iteration):
         for step in range (0, self.num_steps):
-            self.global_step += self.num_envs
+            #self.global_step += self.num_envs
+            self.global_step += self.local_num_envs
+            self.global_step_for_writer += self.num_steps * self.world_size
             self.observations[step] = obs #- initial code
             self.dones[step] = done
             with torch.no_grad():
@@ -177,9 +191,13 @@ class PPO:
             batch_A_k, batch_observations, batch_actions, batch_disc_rewards, \
                 batch_logprobs = self.reshape(A_k)
             batch_inds = np.arange(self.local_batch_size)
+            batchtime = 0
+            allreducetime = 0
+
             for _ in range(self.update_epochs):
                 np.random.shuffle(batch_inds)
                 for i in range(0, self.local_batch_size, self.local_minibatch_size):
+                    batchtimestart = time.time()
                     start = i
                     finish = i + self.local_minibatch_size
                     minibatch_inds = batch_inds[start:finish]
@@ -196,6 +214,7 @@ class PPO:
                     critic_loss.backward()
 
                     if self.world_size > 1:
+                        timestart = time.time()
                         all_actor_grads_list = []
                         for param in self.actor.parameters():
                             if param.grad is not None:
@@ -229,6 +248,8 @@ class PPO:
                                         param.grad.data) / self.world_size
                                 )
                                 offset += param.numel()
+                        timeend = time.time()
+                        allreducetime += timeend - timestart
 
                     # cut gradients
                     nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
@@ -237,7 +258,12 @@ class PPO:
                     self.actor_optim.step()
                     self.critic_optim.step()
 
+                    batchtimeend = time.time()
+                    batchtime +=batchtimeend - batchtimestart
                 #return actor_loss, critic_loss
+            #time_persentage = allreducetime / batchtime
+            return allreducetime, batchtime
+
         except Exception as e:
             print(f"Error in rank {self.rank}: {e}")
             raise
