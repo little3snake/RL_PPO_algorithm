@@ -20,6 +20,8 @@ class PPO:
         self.writer = writer
         self.seed = kwargs.get("seed", 1)
         self.track = kwargs.get("track", False)
+        self.create_gif_bool = kwargs.get("create_gif", False)
+        self.save_policies = kwargs.get("save_policies", False)
 
         self.num_steps = kwargs.get("num_steps", 1) # rollout steps for 1 process per batch
         self.gamma = kwargs.get("gamma", 0.99421)
@@ -100,7 +102,7 @@ class PPO:
             #if self.rank == 0:
                 # self._log_summary()
 
-            if self.rank == 0 and i % self.save_freq == 0:
+            if self.save_policies and  self.rank == 0 and i % self.save_freq == 0:
                 torch.save(self.actor.state_dict(), './ppo_actor.pth')
                 torch.save(self.critic.state_dict(), './ppo_critic.pth')
 
@@ -117,12 +119,12 @@ class PPO:
                     "charts/current_step": int(time.time() - start_time),
                     "charts/actor_learning_rate": self.actor_optim.param_groups[0]["lr"],
                     #"charts/reward_new": reward,
-                    #"charts/reward_new_new": reward,
+                    "charts/reward_new_new": reward,
                 })
                 print ("g_s ", self.global_step, " i ", i, " g_s*w_s ", self.global_step * self.world_size)
 
         # creating a gif
-        if self.rank == 0:
+        if self.create_gif_bool and self.rank == 0:
             frames, total_reward = self.create_gif()
             #frames = []
             #total_reward = 0
@@ -147,11 +149,16 @@ class PPO:
             done = np.logical_or(terminated, truncated)
             obs = torch.tensor(obs).to(self.device)
             done = torch.tensor(done).to(self.device)
+
+        # for different seeds
+        #self.compare_rollouts(self.observations)
+
         print(
             f"local_rank: {self.rank}, action.sum(): {action.sum()}, iteration: {iteration}, "
             f"agent.actor.weight.sum(): {sum(p.sum() for p in self.actor.parameters() if p.requires_grad)}"
             #f"reward: {total_reward}"
         )
+
         self.compute_discounted_rewards()
 
     def compute_discounted_rewards(self):
@@ -267,6 +274,19 @@ class PPO:
         except Exception as e:
             print(f"Error in rank {self.rank}: {e}")
             raise
+
+    def compare_rollouts(self, data):
+        """For compare with different seeds"""
+        data_tensor = torch.tensor(data, dtype=torch.float32).to("cpu")
+        gathered_data = [torch.zeros_like(data_tensor) for _ in range(self.world_size)]
+
+        dist.all_gather(gathered_data, data_tensor)
+
+        if self.rank == 0:
+            for i, d in enumerate(gathered_data):
+                #print(f"Процесс {i}: Среднее = {d.mean().item()}, Std = {d.std().item()}, Min = {d.min().item()}, Max = {d.max().item()}")
+                print(
+                    f"Процесс {i}:, {d.mean().item()}, {d.std().item()}, {d.min().item()}, {d.max().item()}")
 
     def try_for_reward_in_wandb(self):
         episode_len = 0
